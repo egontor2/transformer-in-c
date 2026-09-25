@@ -106,8 +106,50 @@ batches completos de 32 muestras, cinco épocas, `learning_rate=0.0001` y
 
 ```sh
 ./build/organ_smnist TRAIN.csv VAL.csv TEST.csv CHECKPOINT \
-  BATCH EPOCHS LR DECAY
+  BATCH EPOCHS LR DECAY WARMUP_EPOCHS SCHEDULER PATIENCE FACTOR [RESUME] [EARLY_STOPPING]
 ```
+
+El entrenamiento usa por defecto una época de warmup lineal y
+`ReduceLROnPlateau`: reduce el learning rate cuando la pérdida de validación no
+mejora. `SCHEDULER` puede ser `plateau`, `cosine` o `constant`; los valores por
+defecto son `PATIENCE=2` y `FACTOR=0.5`. Para desactivar el warmup usa `0`.
+
+Para reanudar desde un checkpoint existente, añade su ruta como último
+argumento. Se restauran los pesos, estados `m/v` y contadores de AdamW:
+
+```sh
+./build/organ_smnist_mps TRAIN.csv VAL.csv TEST.csv \
+  build/organ_smnist.mps.vit 32 10 0.0001 0.01 1 plateau 2 0.5 \
+  build/organ_smnist.mps.vit
+```
+
+También se puede usar la forma nombrada, recomendada para no depender del
+orden de los argumentos:
+
+```sh
+./build/organ_smnist_mps \
+  --train data/organ_smnist/train.csv \
+  --val data/organ_smnist/val.csv \
+  --test data/organ_smnist/test.csv \
+  --checkpoint build/organ_smnist.mps.continued.vit \
+  --batch 32 --epochs 20 --lr 0.0001 --weight-decay 0.01 \
+  --warmup 1 --scheduler plateau --patience 2 --factor 0.5 \
+  --resume build/organ_smnist.mps.vit --early-stopping 6
+```
+
+`--early-stopping N` detiene el entrenamiento después de `N` épocas sin
+mejora de `val_loss`; `0` lo desactiva.
+
+Al finalizar también se imprime la accuracy por clase del split de test, lo
+que permite detectar clases que el accuracy global oculta.
+
+`--metrics-csv PATH` guarda las métricas de cada época (`learning_rate`,
+`train_loss`, `val_accuracy` y `val_loss`) para comparar ejecuciones y
+graficar la convergencia.
+
+Para compensar desbalance de clases puede usarse
+`--class-weights balanced`; calcula pesos inversamente proporcionales a la
+frecuencia del split de entrenamiento.
 
 Si el número de muestras no es múltiplo del batch, descarta únicamente el
 último batch incompleto; esto mantiene el cache de activaciones con tamaño
@@ -175,12 +217,12 @@ MetalPerformanceShaders, y ejecuta una comprobación numérica. Si no existe
 GPU Metal, `mps_backend_create` devuelve disponibilidad no soportada en lugar
 de producir resultados parciales.
 
-Esta primera integración expone GEMM explícitamente; el binario CPU continúa
-disponible como referencia y el binario MPS activa el dispatch durante el
-entrenamiento. Para acelerar de verdad el modelo completo hay que mantener
-pesos y activaciones en GPU entre capas. La siguiente fase puede añadir buffers
-persistentes y un grafo MPSGraph para el bloque ViT, usando atención SDPA nativa
-cuando el sistema sea macOS 15 o posterior.
+Esta integración expone GEMM explícitamente; el binario CPU continúa disponible
+como referencia y el binario MPS activa el dispatch durante el entrenamiento.
+El backend reutiliza buffers compartidos por clave `(filas, columnas
+interiores, columnas resultado)`, con un límite de 16 formas para evitar un
+crecimiento ilimitado. Los datos siguen copiándose en cada llamada y la
+operación espera síncronamente a la GPU.
 
 Para entrenar con el dispatch MPS activo usa el binario específico de macOS:
 
@@ -201,9 +243,26 @@ las dos multiplicaciones del backward (`dA = dC·Bᵀ`, `dB = Aᵀ·dC`) pasan p
 La ruta sigue siendo síncrona y copia operandos por operación, por lo que es una
 aceleración funcional y no todavía una residencia completa del modelo en GPU.
 
+La arquitectura objetivo sigue el patrón habitual de MPS:
+
+1. Crear `MTLBuffer` persistentes para pesos, activaciones, gradientes y estados
+   del optimizador.
+2. Construir `MPSMatrix` sobre esos buffers y reutilizar sus descriptores.
+3. Encadenar operaciones en un mismo `MTLCommandBuffer` sin sincronizar con la
+   CPU entre cada GEMM.
+4. Usar `MPSGraph` para el bloque ViT completo cuando las formas sean estáticas,
+   incluyendo atención, LayerNorm, activaciones y backward. Esto todavía no
+   está implementado en este backend.
+5. Descargar únicamente las métricas, checkpoints o resultados solicitados.
+
+La migración requiere añadir referencias de dispositivo a los tensores y una
+política explícita de sincronización CPU/GPU; no es correcto simularla copiando
+cada `Tensor` a un buffer temporal.
+
 La API `ops_set_gemm_backend` permite probar el dispatch MPS en operaciones GEMM
 del núcleo sin enlazar Metal en la librería CPU. Es un backend global y debe
 instalarse solo alrededor de trabajo de un único hilo; `ops_reset_gemm_backend`
-restaura la implementación C. La ruta MPS actual es síncrona y copia cada
-operando, por lo que sirve como integración funcional y benchmark, no todavía
-como aceleración óptima del entrenamiento.
+restaura la implementación C. La ruta MPS actual es síncrona y copia cada operando, aunque reutiliza las
+asignaciones Metal por forma. Sirve como integración funcional y benchmark, no
+como residencia completa del modelo en GPU ni como implementación de
+`MPSGraph`.

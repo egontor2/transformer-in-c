@@ -38,6 +38,10 @@ int ops_gelu(const Tensor *input, Tensor *output);
 int ops_gelu_backward(const Tensor *input, const Tensor *output);
 int ops_softmax_cross_entropy(const Tensor *logits, const size_t *targets,
                              float *loss, Tensor *logits_grad);
+int ops_softmax_cross_entropy_weighted(const Tensor *logits,
+                                       const size_t *targets,
+                                       const float *class_weights,
+                                       float *loss, Tensor *logits_grad);
 int ops_adamw_step(Parameter *parameter, float learning_rate,
                    float beta1, float beta2, float epsilon,
                    float weight_decay);

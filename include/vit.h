@@ -182,6 +182,10 @@ int vit_model_train_batch(ViTModel *model, const float *images,
                           const size_t *targets, size_t batch,
                           ViTModelCache *cache, float learning_rate,
                           float weight_decay, float *loss);
+int vit_model_train_batch_weighted(
+    ViTModel *model, const float *images, const size_t *targets, size_t batch,
+    ViTModelCache *cache, float learning_rate, float weight_decay,
+    const float *class_weights, float *loss);
 int vit_model_save(const ViTModel *model, const char *path);
 int vit_model_load(ViTModel *model, const char *path);
 int vit_model_evaluate(const ViTModel *model, const float *images,

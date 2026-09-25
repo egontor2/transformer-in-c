@@ -31,6 +31,14 @@ int main(void) {
                      ? ops_gemm(&left_tensor, &right_tensor, &output_tensor)
                      : -1;
     if (result == 0) {
+        for (int iteration = 0; iteration < 3; ++iteration) {
+            if (ops_gemm(&left_tensor, &right_tensor, &output_tensor) != 0) {
+                result = -1;
+                break;
+            }
+        }
+    }
+    if (result == 0) {
         memcpy(output, output_tensor.data, sizeof(output));
         for (size_t i = 0; i < 4; ++i) {
             output_tensor.grad[i] = 1.0f;

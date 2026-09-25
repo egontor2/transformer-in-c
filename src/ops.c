@@ -292,6 +292,14 @@ int ops_gelu_backward(const Tensor *input, const Tensor *output) {
 
 int ops_softmax_cross_entropy(const Tensor *logits, const size_t *targets,
                               float *loss, Tensor *logits_grad) {
+    return ops_softmax_cross_entropy_weighted(logits, targets, NULL, loss,
+                                              logits_grad);
+}
+
+int ops_softmax_cross_entropy_weighted(const Tensor *logits,
+                                       const size_t *targets,
+                                       const float *class_weights,
+                                       float *loss, Tensor *logits_grad) {
     if (!is_matrix(logits) || !targets || !loss || !is_matrix(logits_grad) ||
         logits_grad->rows != logits->rows || logits_grad->cols != logits->cols) {
         return -1;
@@ -312,12 +320,13 @@ int ops_softmax_cross_entropy(const Tensor *logits, const size_t *targets,
             denominator += expf(logits->data[row * logits->cols + col] - maximum);
         }
         const float target_logit = logits->data[row * logits->cols + targets[row]];
-        *loss += -target_logit + maximum + logf(denominator);
+        const float weight = class_weights ? class_weights[targets[row]] : 1.0f;
+        *loss += weight * (-target_logit + maximum + logf(denominator));
         for (size_t col = 0; col < logits->cols; ++col) {
             const float probability =
                 expf(logits->data[row * logits->cols + col] - maximum) / denominator;
             logits_grad->grad[row * logits->cols + col] +=
-                probability - (col == targets[row] ? 1.0f : 0.0f);
+                weight * (probability - (col == targets[row] ? 1.0f : 0.0f));
         }
     }
     *loss /= (float)logits->rows;

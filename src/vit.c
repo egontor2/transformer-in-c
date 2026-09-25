@@ -1078,6 +1078,15 @@ int vit_model_train_batch(ViTModel *model, const float *images,
                           const size_t *targets, size_t batch,
                           ViTModelCache *cache, float learning_rate,
                           float weight_decay, float *loss) {
+    return vit_model_train_batch_weighted(
+        model, images, targets, batch, cache, learning_rate, weight_decay,
+        NULL, loss);
+}
+
+int vit_model_train_batch_weighted(
+    ViTModel *model, const float *images, const size_t *targets, size_t batch,
+    ViTModelCache *cache, float learning_rate, float weight_decay,
+    const float *class_weights, float *loss) {
     if (!model || !images || !targets || !cache || !loss || batch == 0 ||
         cache->batch != batch || learning_rate <= 0.0f || weight_decay < 0.0f) {
         return -1;
@@ -1085,8 +1094,8 @@ int vit_model_train_batch(ViTModel *model, const float *images,
     vit_model_zero_grad(model);
     vit_model_zero_cache_grad(cache);
     if (vit_model_forward(model, images, batch, cache) != 0 ||
-        ops_softmax_cross_entropy(&cache->logits, targets, loss,
-                                  &cache->logits) != 0) {
+        ops_softmax_cross_entropy_weighted(
+            &cache->logits, targets, class_weights, loss, &cache->logits) != 0) {
         return -1;
     }
     const size_t image_count = batch * model->config.channels *
