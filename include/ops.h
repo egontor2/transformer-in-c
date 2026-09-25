@@ -26,4 +26,13 @@ int ops_adamw_step(Parameter *parameter, float learning_rate,
                    float beta1, float beta2, float epsilon,
                    float weight_decay);
 
+int ops_causal_attention(const Tensor *query, const Tensor *key,
+                         const Tensor *value, float scale,
+                         Tensor *probabilities, Tensor *output);
+int ops_causal_attention_backward(const Tensor *query, const Tensor *key,
+                                  const Tensor *value, float scale,
+                                  const Tensor *probabilities,
+                                  const Tensor *output, Tensor *query_grad,
+                                  Tensor *key_grad, Tensor *value_grad);
+
 #endif

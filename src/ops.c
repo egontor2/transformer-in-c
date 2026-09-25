@@ -290,3 +290,110 @@ int ops_adamw_step(Parameter *parameter, float learning_rate,
     parameter_zero_grad(parameter);
     return 0;
 }
+
+int ops_causal_attention(const Tensor *query, const Tensor *key,
+                         const Tensor *value, float scale,
+                         Tensor *probabilities, Tensor *output) {
+    if (!is_matrix(query) || !is_matrix(key) || !is_matrix(value) ||
+        !is_matrix(probabilities) || !is_matrix(output) || scale <= 0.0f ||
+        query->rows != key->rows || key->rows != value->rows ||
+        query->cols != key->cols || probabilities->rows != query->rows ||
+        probabilities->cols != key->rows || output->rows != query->rows ||
+        output->cols != value->cols) {
+        return -1;
+    }
+    const size_t length = query->rows;
+    for (size_t row = 0; row < length; ++row) {
+        float maximum = -INFINITY;
+        for (size_t col = 0; col < length; ++col) {
+            float score = -INFINITY;
+            if (col <= row) {
+                score = 0.0f;
+                for (size_t dimension = 0; dimension < query->cols; ++dimension) {
+                    score += query->data[row * query->cols + dimension] *
+                             key->data[col * key->cols + dimension];
+                }
+                score *= scale;
+                if (score > maximum) {
+                    maximum = score;
+                }
+            }
+            probabilities->data[row * probabilities->cols + col] = score;
+        }
+        float denominator = 0.0f;
+        for (size_t col = 0; col < length; ++col) {
+            if (col <= row) {
+                probabilities->data[row * probabilities->cols + col] =
+                    expf(probabilities->data[row * probabilities->cols + col] -
+                         maximum);
+                denominator += probabilities->data[row * probabilities->cols + col];
+            } else {
+                probabilities->data[row * probabilities->cols + col] = 0.0f;
+            }
+        }
+        for (size_t col = 0; col < length; ++col) {
+            probabilities->data[row * probabilities->cols + col] /= denominator;
+        }
+        for (size_t dimension = 0; dimension < output->cols; ++dimension) {
+            float result = 0.0f;
+            for (size_t col = 0; col <= row; ++col) {
+                result += probabilities->data[row * probabilities->cols + col] *
+                          value->data[col * value->cols + dimension];
+            }
+            output->data[row * output->cols + dimension] = result;
+        }
+    }
+    return 0;
+}
+
+int ops_causal_attention_backward(const Tensor *query, const Tensor *key,
+                                  const Tensor *value, float scale,
+                                  const Tensor *probabilities,
+                                  const Tensor *output, Tensor *query_grad,
+                                  Tensor *key_grad, Tensor *value_grad) {
+    if (!is_matrix(query) || !is_matrix(key) || !is_matrix(value) ||
+        !is_matrix(probabilities) || !is_matrix(output) ||
+        !is_matrix(query_grad) || !is_matrix(key_grad) ||
+        !is_matrix(value_grad) || scale <= 0.0f ||
+        query->rows != key->rows || key->rows != value->rows ||
+        query->cols != key->cols || probabilities->rows != query->rows ||
+        probabilities->cols != key->rows || output->rows != query->rows ||
+        output->cols != value->cols || query_grad->rows != query->rows ||
+        query_grad->cols != query->cols || key_grad->rows != key->rows ||
+        key_grad->cols != key->cols || value_grad->rows != value->rows ||
+        value_grad->cols != value->cols) {
+        return -1;
+    }
+    const size_t length = query->rows;
+    for (size_t row = 0; row < length; ++row) {
+        for (size_t col = 0; col <= row; ++col) {
+            float probability_gradient = 0.0f;
+            for (size_t dimension = 0; dimension < output->cols; ++dimension) {
+                probability_gradient +=
+                    output->grad[row * output->cols + dimension] *
+                    value->data[col * value->cols + dimension];
+                value_grad->grad[col * value->cols + dimension] +=
+                    probabilities->data[row * probabilities->cols + col] *
+                    output->grad[row * output->cols + dimension];
+            }
+            float softmax_gradient = probability_gradient *
+                probabilities->data[row * probabilities->cols + col];
+            for (size_t other = 0; other <= row; ++other) {
+                float upstream = 0.0f;
+                for (size_t dimension = 0; dimension < output->cols; ++dimension) {
+                    upstream += output->grad[row * output->cols + dimension] *
+                        value->data[other * value->cols + dimension];
+                }
+                softmax_gradient -= probabilities->data[row * probabilities->cols + col] *
+                    probabilities->data[row * probabilities->cols + other] * upstream;
+            }
+            for (size_t dimension = 0; dimension < query->cols; ++dimension) {
+                query_grad->grad[row * query->cols + dimension] +=
+                    scale * softmax_gradient * key->data[col * key->cols + dimension];
+                key_grad->grad[col * key->cols + dimension] +=
+                    scale * softmax_gradient * query->data[row * query->cols + dimension];
+            }
+        }
+    }
+    return 0;
+}

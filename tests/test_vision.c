@@ -3,6 +3,7 @@
 #include "autodiff.h"
 #include "ops.h"
 #include "arena.h"
+#include "vit.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -17,6 +18,140 @@ static int expect(int condition, const char *message) {
 }
 
 int main(void) {
+    ViTPatchProjection patch_projection = {0};
+    Tensor patch_tokens = {0};
+    int vit_failures = vit_patch_projection_init(
+        &patch_projection, 1, 2, 4, 2, 2) != 0 ||
+        tensor_init(&patch_tokens, 2, 2) != 0;
+    const float patch_image[8] = {
+        1.0f, 2.0f, 3.0f, 4.0f,
+        5.0f, 6.0f, 7.0f, 8.0f,
+    };
+    if (!vit_failures) {
+        patch_projection.projection.value.data[0] = 1.0f;
+        patch_projection.projection.value.data[1] = 0.0f;
+        patch_projection.projection.value.data[2] = 0.0f;
+        patch_projection.projection.value.data[3] = 1.0f;
+        patch_projection.projection.value.data[4] = 1.0f;
+        patch_projection.projection.value.data[5] = 0.0f;
+        patch_projection.projection.value.data[6] = 0.0f;
+        patch_projection.projection.value.data[7] = 1.0f;
+        vit_failures = vit_patch_projection_forward(
+            &patch_projection, patch_image, 1, &patch_tokens) != 0 ||
+            fabsf(patch_tokens.data[0] - 6.0f) > 1e-6f ||
+            fabsf(patch_tokens.data[1] - 8.0f) > 1e-6f ||
+            fabsf(patch_tokens.data[2] - 10.0f) > 1e-6f ||
+            fabsf(patch_tokens.data[3] - 12.0f) > 1e-6f;
+        patch_tokens.grad[0] = 1.0f;
+        patch_tokens.grad[1] = 1.0f;
+        patch_tokens.grad[2] = 1.0f;
+        patch_tokens.grad[3] = 1.0f;
+        float patch_image_grad[8] = {0};
+        vit_failures = vit_failures ||
+            vit_patch_projection_backward(&patch_projection, patch_image, 1,
+                                          &patch_tokens, patch_image_grad) != 0 ||
+            fabsf(patch_image_grad[0] - 1.0f) > 1e-6f ||
+            fabsf(patch_image_grad[7] - 1.0f) > 1e-6f ||
+            fabsf(patch_projection.bias.value.grad[0] - 2.0f) > 1e-6f;
+    }
+    tensor_free(&patch_tokens);
+    vit_patch_projection_free(&patch_projection);
+    if (vit_failures) {
+        fprintf(stderr, "FAIL: ViT patch projection\n");
+        return 1;
+    }
+
+    ViTTokenEmbedding token_embedding = {0};
+    Tensor token_patch_input = {0};
+    Tensor token_output = {0};
+    Tensor token_patch_grad = {0};
+    int token_failures = vit_token_embedding_init(
+        &token_embedding, 2, 2) != 0 ||
+        tensor_init(&token_patch_input, 2, 2) != 0 ||
+        tensor_init(&token_output, 3, 2) != 0 ||
+        tensor_init(&token_patch_grad, 2, 2) != 0;
+    if (!token_failures) {
+        token_patch_input.data[0] = 6.0f;
+        token_patch_input.data[1] = 8.0f;
+        token_patch_input.data[2] = 10.0f;
+        token_patch_input.data[3] = 12.0f;
+        token_embedding.cls_token.value.data[0] = 10.0f;
+        token_embedding.cls_token.value.data[1] = 20.0f;
+        token_embedding.positional_embeddings.value.data[0] = 1.0f;
+        token_embedding.positional_embeddings.value.data[1] = 2.0f;
+        token_embedding.positional_embeddings.value.data[2] = 3.0f;
+        token_embedding.positional_embeddings.value.data[3] = 4.0f;
+        token_failures = vit_token_embedding_forward(
+            &token_embedding, &token_patch_input, 1, &token_output) != 0 ||
+            fabsf(token_output.data[0] - 11.0f) > 1e-6f ||
+            fabsf(token_output.data[1] - 22.0f) > 1e-6f ||
+            fabsf(token_output.data[2] - 9.0f) > 1e-6f ||
+            fabsf(token_output.data[3] - 12.0f) > 1e-6f;
+        for (size_t i = 0; i < 6; ++i) {
+            token_output.grad[i] = 1.0f;
+        }
+        token_failures = token_failures ||
+            vit_token_embedding_backward(&token_embedding, &token_output, 1,
+                                         &token_patch_grad) != 0 ||
+            fabsf(token_embedding.cls_token.value.grad[0] - 1.0f) > 1e-6f ||
+            fabsf(token_embedding.positional_embeddings.value.grad[0] - 1.0f) > 1e-6f ||
+            fabsf(token_embedding.positional_embeddings.value.grad[2] - 1.0f) > 1e-6f ||
+            fabsf(token_patch_grad.grad[0] - 1.0f) > 1e-6f;
+    }
+    tensor_free(&token_patch_input);
+    tensor_free(&token_output);
+    tensor_free(&token_patch_grad);
+    vit_token_embedding_free(&token_embedding);
+    if (token_failures) {
+        fprintf(stderr, "FAIL: ViT CLS and positional embeddings\n");
+        return 1;
+    }
+
+    Tensor query = {0};
+    Tensor key = {0};
+    Tensor value = {0};
+    Tensor probabilities = {0};
+    Tensor attended = {0};
+    Tensor query_grad = {0};
+    Tensor key_grad = {0};
+    Tensor value_grad = {0};
+    int attention_failures = tensor_init(&query, 2, 2) != 0 ||
+        tensor_init(&key, 2, 2) != 0 || tensor_init(&value, 2, 1) != 0 ||
+        tensor_init(&probabilities, 2, 2) != 0 || tensor_init(&attended, 2, 1) != 0 ||
+        tensor_init(&query_grad, 2, 2) != 0 || tensor_init(&key_grad, 2, 2) != 0 ||
+        tensor_init(&value_grad, 2, 1) != 0;
+    if (!attention_failures) {
+        query.data[0] = 1.0f;
+        query.data[3] = 1.0f;
+        key.data[0] = 1.0f;
+        key.data[3] = 1.0f;
+        value.data[0] = 2.0f;
+        value.data[1] = 4.0f;
+        attention_failures = ops_causal_attention(
+            &query, &key, &value, 1.0f, &probabilities, &attended) != 0 ||
+            fabsf(probabilities.data[1]) > 1e-6f ||
+            probabilities.data[2] < 0.2f || probabilities.data[2] > 0.4f ||
+            probabilities.data[3] < 0.6f || probabilities.data[3] > 0.8f;
+        attended.grad[0] = 1.0f;
+        attention_failures = attention_failures ||
+            ops_causal_attention_backward(&query, &key, &value, 1.0f,
+                                          &probabilities, &attended,
+                                          &query_grad, &key_grad, &value_grad) != 0 ||
+            !isfinite(query_grad.grad[0]);
+    }
+    tensor_free(&query);
+    tensor_free(&key);
+    tensor_free(&value);
+    tensor_free(&probabilities);
+    tensor_free(&attended);
+    tensor_free(&query_grad);
+    tensor_free(&key_grad);
+    tensor_free(&value_grad);
+    if (attention_failures) {
+        fprintf(stderr, "FAIL: causal attention\n");
+        return 1;
+    }
+
     Arena arena = {0};
     Tensor arena_tensor = {0};
     const size_t arena_shape[3] = {2, 2, 2};

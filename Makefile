@@ -4,7 +4,7 @@ CPPFLAGS := -Iinclude
 LDFLAGS := -lm
 
 LIBRARY := build/libtransformer.a
-OBJECTS := build/transformer.o build/dataset.o build/autodiff.o build/arena.o build/ops.o
+OBJECTS := build/transformer.o build/dataset.o build/autodiff.o build/arena.o build/ops.o build/vit.o
 
 .PHONY: all clean run test
 
@@ -31,6 +31,10 @@ build/arena.o: src/arena.c include/arena.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 build/ops.o: src/ops.c include/ops.h include/tensor.h
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+build/vit.o: src/vit.c include/vit.h include/tensor.h
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
