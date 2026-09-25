@@ -152,6 +152,61 @@ int main(void) {
         return 1;
     }
 
+    Tensor multi_query = {0};
+    Tensor multi_key = {0};
+    Tensor multi_value = {0};
+    Tensor multi_probabilities = {0};
+    Tensor multi_output = {0};
+    Tensor multi_query_grad = {0};
+    Tensor multi_key_grad = {0};
+    Tensor multi_value_grad = {0};
+    int multi_head_failures = tensor_init(&multi_query, 2, 2) != 0 ||
+        tensor_init(&multi_key, 2, 2) != 0 ||
+        tensor_init(&multi_value, 2, 1) != 0 ||
+        tensor_init(&multi_probabilities, 2, 2) != 0 ||
+        tensor_init(&multi_output, 2, 1) != 0 ||
+        tensor_init(&multi_query_grad, 2, 2) != 0 ||
+        tensor_init(&multi_key_grad, 2, 2) != 0 ||
+        tensor_init(&multi_value_grad, 2, 1) != 0;
+    if (!multi_head_failures) {
+        multi_query.data[0] = 1.0f;
+        multi_query.data[3] = 1.0f;
+        multi_key.data[0] = 1.0f;
+        multi_key.data[3] = 1.0f;
+        multi_value.data[0] = 2.0f;
+        multi_value.data[1] = 4.0f;
+        multi_head_failures =
+            ops_multi_head_attention(&multi_query, &multi_key, &multi_value,
+                                     1, 1, 2, 1.0f, &multi_probabilities,
+                                     &multi_output) != 0 ||
+            multi_probabilities.data[0] < 0.6f ||
+            multi_probabilities.data[1] < 0.2f ||
+            fabsf(multi_probabilities.data[0] +
+                  multi_probabilities.data[1] - 1.0f) > 1e-6f;
+        multi_output.grad[0] = 1.0f;
+        multi_output.grad[1] = 1.0f;
+        multi_head_failures = multi_head_failures ||
+            ops_multi_head_attention_backward(
+                &multi_query, &multi_key, &multi_value, 1, 1, 2, 1.0f,
+                &multi_probabilities, &multi_output, &multi_query_grad,
+                &multi_key_grad, &multi_value_grad) != 0 ||
+            !isfinite(multi_query_grad.grad[0]) ||
+            !isfinite(multi_key_grad.grad[0]) ||
+            !isfinite(multi_value_grad.grad[0]);
+    }
+    tensor_free(&multi_query);
+    tensor_free(&multi_key);
+    tensor_free(&multi_value);
+    tensor_free(&multi_probabilities);
+    tensor_free(&multi_output);
+    tensor_free(&multi_query_grad);
+    tensor_free(&multi_key_grad);
+    tensor_free(&multi_value_grad);
+    if (multi_head_failures) {
+        fprintf(stderr, "FAIL: bidirectional multi-head attention\n");
+        return 1;
+    }
+
     Arena arena = {0};
     Tensor arena_tensor = {0};
     const size_t arena_shape[3] = {2, 2, 2};

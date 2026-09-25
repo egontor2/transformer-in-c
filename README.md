@@ -59,8 +59,8 @@ La base de entrenamiento desde cero está organizada en:
   `arena_reset` entre iteraciones.
 - `include/ops.h`: GEMM, GEMM con la izquierda transpuesta, residuales y sus
   pases backward acumulativos, LayerNorm, GELU, softmax + cross-entropy y
-  AdamW. También incluye `ops_causal_attention`, con máscara causal y
-  backward explícito para Q, K y V.
+  AdamW. También incluye atención causal y atención multi-head
+  bidireccional, con backward explícito para Q, K y V.
 
 Las operaciones devuelven `0` si tienen shapes compatibles y `-1` ante una
 forma inválida. El siguiente bloque de la guía es completar las primitivas

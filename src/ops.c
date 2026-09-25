@@ -397,3 +397,146 @@ int ops_causal_attention_backward(const Tensor *query, const Tensor *key,
     }
     return 0;
 }
+
+static int valid_multi_head_attention(const Tensor *query, const Tensor *key,
+                                      const Tensor *value, size_t batch,
+                                      size_t heads, size_t sequence_length,
+                                      float scale, const Tensor *probabilities,
+                                      const Tensor *output) {
+    const size_t rows = batch * heads * sequence_length;
+    return is_matrix(query) && is_matrix(key) && is_matrix(value) &&
+           is_matrix(probabilities) && is_matrix(output) && batch > 0 &&
+           heads > 0 && sequence_length > 0 && scale > 0.0f &&
+           query->rows == rows && key->rows == rows && value->rows == rows &&
+           query->cols == key->cols && probabilities->rows == rows &&
+           probabilities->cols == sequence_length && output->rows == rows;
+}
+
+int ops_multi_head_attention(const Tensor *query, const Tensor *key,
+                             const Tensor *value, size_t batch,
+                             size_t heads, size_t sequence_length,
+                             float scale, Tensor *probabilities,
+                             Tensor *output) {
+    if (!valid_multi_head_attention(query, key, value, batch, heads,
+                                    sequence_length, scale, probabilities,
+                                    output) ||
+        output->cols != value->cols) {
+        return -1;
+    }
+    const size_t rows_per_head = sequence_length;
+    const size_t groups = batch * heads;
+    for (size_t group = 0; group < groups; ++group) {
+        const size_t group_start = group * rows_per_head;
+        for (size_t query_index = 0; query_index < sequence_length;
+             ++query_index) {
+            const size_t query_row = group_start + query_index;
+            float maximum = -INFINITY;
+            for (size_t key_index = 0; key_index < sequence_length;
+                 ++key_index) {
+                float score = 0.0f;
+                for (size_t dimension = 0; dimension < query->cols; ++dimension) {
+                    score += query->data[query_row * query->cols + dimension] *
+                             key->data[(group_start + key_index) * key->cols +
+                                       dimension];
+                }
+                score *= scale;
+                probabilities->data[query_row * probabilities->cols + key_index] =
+                    score;
+                if (score > maximum) {
+                    maximum = score;
+                }
+            }
+            float denominator = 0.0f;
+            for (size_t key_index = 0; key_index < sequence_length;
+                 ++key_index) {
+                float *probability =
+                    &probabilities->data[query_row * probabilities->cols + key_index];
+                *probability = expf(*probability - maximum);
+                denominator += *probability;
+            }
+            for (size_t key_index = 0; key_index < sequence_length;
+                 ++key_index) {
+                probabilities->data[query_row * probabilities->cols + key_index] /=
+                    denominator;
+            }
+            for (size_t dimension = 0; dimension < output->cols; ++dimension) {
+                float result = 0.0f;
+                for (size_t key_index = 0; key_index < sequence_length;
+                     ++key_index) {
+                    result += probabilities->data[
+                                  query_row * probabilities->cols + key_index] *
+                              value->data[(group_start + key_index) * value->cols +
+                                          dimension];
+                }
+                output->data[query_row * output->cols + dimension] = result;
+            }
+        }
+    }
+    return 0;
+}
+
+int ops_multi_head_attention_backward(
+    const Tensor *query, const Tensor *key, const Tensor *value,
+    size_t batch, size_t heads, size_t sequence_length, float scale,
+    const Tensor *probabilities, const Tensor *output, Tensor *query_grad,
+    Tensor *key_grad, Tensor *value_grad) {
+    if (!valid_multi_head_attention(query, key, value, batch, heads,
+                                    sequence_length, scale, probabilities,
+                                    output) ||
+        !is_matrix(query_grad) || !is_matrix(key_grad) ||
+        !is_matrix(value_grad) ||
+        output->cols != value->cols || query_grad->rows != query->rows ||
+        query_grad->cols != query->cols || key_grad->rows != key->rows ||
+        key_grad->cols != key->cols || value_grad->rows != value->rows ||
+        value_grad->cols != value->cols) {
+        return -1;
+    }
+    const size_t groups = batch * heads;
+    for (size_t group = 0; group < groups; ++group) {
+        const size_t group_start = group * sequence_length;
+        for (size_t query_index = 0; query_index < sequence_length;
+             ++query_index) {
+            const size_t query_row = group_start + query_index;
+            float probability_dot_gradient = 0.0f;
+            for (size_t key_index = 0; key_index < sequence_length;
+                 ++key_index) {
+                const size_t key_row = group_start + key_index;
+                float probability_gradient = 0.0f;
+                for (size_t dimension = 0; dimension < output->cols; ++dimension) {
+                    probability_gradient +=
+                        output->grad[query_row * output->cols + dimension] *
+                        value->data[key_row * value->cols + dimension];
+                    value_grad->grad[key_row * value->cols + dimension] +=
+                        probabilities->data[query_row * probabilities->cols +
+                                             key_index] *
+                        output->grad[query_row * output->cols + dimension];
+                }
+                probability_dot_gradient +=
+                    probabilities->data[query_row * probabilities->cols + key_index] *
+                    probability_gradient;
+            }
+            for (size_t key_index = 0; key_index < sequence_length;
+                 ++key_index) {
+                const size_t key_row = group_start + key_index;
+                float probability_gradient = 0.0f;
+                for (size_t dimension = 0; dimension < output->cols; ++dimension) {
+                    probability_gradient +=
+                        output->grad[query_row * output->cols + dimension] *
+                        value->data[key_row * value->cols + dimension];
+                }
+                const float score_gradient =
+                    probabilities->data[query_row * probabilities->cols + key_index] *
+                    (probability_gradient - probability_dot_gradient);
+                for (size_t dimension = 0; dimension < query->cols; ++dimension) {
+                    query_grad->grad[query_row * query->cols + dimension] +=
+                        scale * score_gradient *
+                        key->data[key_row * key->cols + dimension];
+                    key_grad->grad[key_row * key->cols + dimension] +=
+                        scale * score_gradient *
+                        query->data[query_row * query->cols + dimension];
+                }
+            }
+        }
+    }
+    return 0;
+}

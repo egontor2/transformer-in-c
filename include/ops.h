@@ -34,5 +34,15 @@ int ops_causal_attention_backward(const Tensor *query, const Tensor *key,
                                   const Tensor *probabilities,
                                   const Tensor *output, Tensor *query_grad,
                                   Tensor *key_grad, Tensor *value_grad);
+int ops_multi_head_attention(const Tensor *query, const Tensor *key,
+                             const Tensor *value, size_t batch,
+                             size_t heads, size_t sequence_length,
+                             float scale, Tensor *probabilities,
+                             Tensor *output);
+int ops_multi_head_attention_backward(
+    const Tensor *query, const Tensor *key, const Tensor *value,
+    size_t batch, size_t heads, size_t sequence_length, float scale,
+    const Tensor *probabilities, const Tensor *output, Tensor *query_grad,
+    Tensor *key_grad, Tensor *value_grad);
 
 #endif
