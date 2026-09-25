@@ -2,8 +2,29 @@
 
 #include <math.h>
 
+static OpsGemmBackend active_gemm_backend;
+static OpsGemmBackwardBackend active_gemm_backward_backend;
+static void *active_gemm_context;
+
 static int is_matrix(const Tensor *tensor) {
     return tensor && tensor->ndim == 2 && tensor->data && tensor->grad;
+}
+
+void ops_set_gemm_backend(OpsGemmBackend backend, void *context) {
+    active_gemm_backend = backend;
+    active_gemm_context = context;
+}
+
+void ops_set_gemm_backward_backend(OpsGemmBackwardBackend backend,
+                                   void *context) {
+    active_gemm_backward_backend = backend;
+    active_gemm_context = context;
+}
+
+void ops_reset_gemm_backend(void) {
+    active_gemm_backend = NULL;
+    active_gemm_backward_backend = NULL;
+    active_gemm_context = NULL;
 }
 
 int ops_gemm(const Tensor *left, const Tensor *right, Tensor *output) {
@@ -11,6 +32,12 @@ int ops_gemm(const Tensor *left, const Tensor *right, Tensor *output) {
         left->cols != right->rows || output->rows != left->rows ||
         output->cols != right->cols) {
         return -1;
+    }
+    if (active_gemm_backend &&
+        active_gemm_backend(active_gemm_context, left->data, right->data,
+                            output->data, left->rows, left->cols,
+                            right->cols) == 0) {
+        return 0;
     }
     for (size_t row = 0; row < output->rows; ++row) {
         for (size_t col = 0; col < output->cols; ++col) {
@@ -30,6 +57,13 @@ int ops_gemm_backward(Tensor *left, Tensor *right, const Tensor *output) {
         left->cols != right->rows || output->rows != left->rows ||
         output->cols != right->cols) {
         return -1;
+    }
+    if (active_gemm_backward_backend &&
+        active_gemm_backward_backend(
+            active_gemm_context, left->data, right->data, output->grad,
+            left->grad, right->grad, left->rows, left->cols,
+            right->cols) == 0) {
+        return 0;
     }
     for (size_t row = 0; row < left->rows; ++row) {
         for (size_t i = 0; i < left->cols; ++i) {
@@ -104,9 +138,38 @@ int ops_residual_backward(Tensor *left, Tensor *right, const Tensor *output) {
         output->rows != left->rows || output->cols != left->cols) {
         return -1;
     }
+
     for (size_t i = 0; i < left->rows * left->cols; ++i) {
         left->grad[i] += output->grad[i];
         right->grad[i] += output->grad[i];
+    }
+    return 0;
+}
+
+int ops_bias_add(const Tensor *input, const Tensor *bias, Tensor *output) {
+    if (!is_matrix(input) || !is_matrix(bias) || !is_matrix(output) ||
+        bias->rows != 1 || bias->cols != input->cols ||
+        output->rows != input->rows || output->cols != input->cols) {
+        return -1;
+    }
+    for (size_t row = 0; row < input->rows; ++row) {
+        for (size_t col = 0; col < input->cols; ++col) {
+            output->data[row * output->cols + col] =
+                input->data[row * input->cols + col] + bias->data[col];
+        }
+    }
+    return 0;
+}
+
+int ops_bias_add_backward(const Tensor *output, Tensor *bias_grad) {
+    if (!is_matrix(output) || !is_matrix(bias_grad) ||
+        bias_grad->rows != 1 || bias_grad->cols != output->cols) {
+        return -1;
+    }
+    for (size_t row = 0; row < output->rows; ++row) {
+        for (size_t col = 0; col < output->cols; ++col) {
+            bias_grad->grad[col] += output->grad[row * output->cols + col];
+        }
     }
     return 0;
 }

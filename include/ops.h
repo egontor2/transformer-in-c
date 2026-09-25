@@ -3,6 +3,20 @@
 
 #include "tensor.h"
 
+typedef int (*OpsGemmBackend)(void *context, const float *left,
+                              const float *right, float *output,
+                              size_t left_rows, size_t left_cols,
+                              size_t right_cols);
+typedef int (*OpsGemmBackwardBackend)(
+    void *context, const float *left, const float *right,
+    const float *output_grad, float *left_grad, float *right_grad,
+    size_t left_rows, size_t left_cols, size_t right_cols);
+
+/* The backend is process-global; install it only around single-threaded work. */
+void ops_set_gemm_backend(OpsGemmBackend backend, void *context);
+void ops_set_gemm_backward_backend(OpsGemmBackwardBackend backend,
+                                   void *context);
+void ops_reset_gemm_backend(void);
 int ops_gemm(const Tensor *left, const Tensor *right, Tensor *output);
 int ops_gemm_backward(Tensor *left, Tensor *right, const Tensor *output);
 int ops_gemm_transposed_left(const Tensor *left, const Tensor *right,
@@ -11,6 +25,8 @@ int ops_gemm_transposed_left_backward(Tensor *left, Tensor *right,
                                       const Tensor *output);
 int ops_residual(const Tensor *left, const Tensor *right, Tensor *output);
 int ops_residual_backward(Tensor *left, Tensor *right, const Tensor *output);
+int ops_bias_add(const Tensor *input, const Tensor *bias, Tensor *output);
+int ops_bias_add_backward(const Tensor *output, Tensor *bias_grad);
 
 int ops_layer_norm(const Tensor *input, const Tensor *gamma, const Tensor *beta,
                    float epsilon, Tensor *output);

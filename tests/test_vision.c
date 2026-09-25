@@ -8,6 +8,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static int expect(int condition, const char *message) {
     if (!condition) {
@@ -18,6 +19,44 @@ static int expect(int condition, const char *message) {
 }
 
 int main(void) {
+    ViTClassificationHead classification_head = {0};
+    Tensor classification_tokens = {0};
+    Tensor classification_logits = {0};
+    int classification_failures = vit_classification_head_init(
+        &classification_head, 2, 2) != 0 ||
+        tensor_init(&classification_tokens, 3, 2) != 0 ||
+        tensor_init(&classification_logits, 1, 2) != 0;
+    if (!classification_failures) {
+        classification_tokens.data[0] = 2.0f;
+        classification_tokens.data[1] = 3.0f;
+        classification_head.projection.value.data[0] = 1.0f;
+        classification_head.projection.value.data[1] = 2.0f;
+        classification_head.projection.value.data[2] = 3.0f;
+        classification_head.projection.value.data[3] = 4.0f;
+        classification_failures =
+            vit_classification_head_forward(&classification_head,
+                                            &classification_tokens, 1, 3,
+                                            &classification_logits) != 0 ||
+            fabsf(classification_logits.data[0] - 11.0f) > 1e-6f ||
+            fabsf(classification_logits.data[1] - 16.0f) > 1e-6f;
+        classification_logits.grad[0] = 1.0f;
+        classification_logits.grad[1] = -1.0f;
+        classification_failures = classification_failures ||
+            vit_classification_head_backward(&classification_head,
+                                             &classification_tokens, 1, 3,
+                                             &classification_logits,
+                                             &classification_tokens) != 0 ||
+            fabsf(classification_head.bias.value.grad[0] - 1.0f) > 1e-6f ||
+            fabsf(classification_tokens.grad[0] + 1.0f) > 1e-6f;
+    }
+    tensor_free(&classification_tokens);
+    tensor_free(&classification_logits);
+    vit_classification_head_free(&classification_head);
+    if (classification_failures) {
+        fprintf(stderr, "FAIL: ViT classification head\n");
+        return 1;
+    }
+
     ViTEncoderBlock encoder_block = {0};
     Tensor block_input = {0};
     Tensor block_output = {0};
@@ -40,6 +79,173 @@ int main(void) {
     vit_encoder_block_free(&encoder_block);
     if (block_failures) {
         fprintf(stderr, "FAIL: ViT encoder block forward\n");
+        return 1;
+    }
+
+    ViTEncoderBlock cached_block = {0};
+    ViTEncoderBlockCache block_cache = {0};
+    Tensor cached_input = {0};
+    Tensor cached_input_grad = {0};
+    int cached_failures = vit_encoder_block_init(
+        &cached_block, 4, 2, 3) != 0 ||
+        tensor_init(&cached_input, 3, 4) != 0 ||
+        tensor_init(&cached_input_grad, 3, 4) != 0 ||
+        vit_encoder_block_cache_init(&block_cache, &cached_block, 1) != 0;
+    if (!cached_failures) {
+        for (size_t i = 0; i < tensor_numel(&cached_input); ++i) {
+            cached_input.data[i] = (float)(i + 1) * 0.07f;
+        }
+        cached_failures =
+            vit_encoder_block_forward_cached(&cached_block, &cached_input,
+                                             &block_cache) != 0;
+        for (size_t i = 0; i < tensor_numel(&block_cache.output); ++i) {
+            block_cache.output.grad[i] = 1.0f;
+        }
+        cached_failures = cached_failures ||
+            vit_encoder_block_backward(&cached_block, &cached_input,
+                                       &block_cache, &cached_input_grad) != 0;
+        for (size_t i = 0; i < tensor_numel(&cached_input_grad); ++i) {
+            cached_failures = cached_failures ||
+                !isfinite(cached_input_grad.grad[i]);
+        }
+        cached_failures = cached_failures ||
+            !isfinite(cached_block.query_key_value.value.grad[0]) ||
+            !isfinite(cached_block.mlp_output.value.grad[0]);
+        const float step = 1e-3f;
+        const float original = cached_input.data[0];
+        cached_input.data[0] = original + step;
+        vit_encoder_block_forward_cached(&cached_block, &cached_input,
+                                         &block_cache);
+        float positive = 0.0f;
+        for (size_t i = 0; i < tensor_numel(&block_cache.output); ++i) {
+            positive += block_cache.output.data[i];
+        }
+        cached_input.data[0] = original - step;
+        vit_encoder_block_forward_cached(&cached_block, &cached_input,
+                                         &block_cache);
+        float negative = 0.0f;
+        for (size_t i = 0; i < tensor_numel(&block_cache.output); ++i) {
+            negative += block_cache.output.data[i];
+        }
+        cached_input.data[0] = original;
+        cached_failures = cached_failures ||
+            fabsf((positive - negative) / (2.0f * step) -
+                  cached_input_grad.grad[0]) > 2e-2f;
+    }
+    tensor_free(&cached_input);
+    tensor_free(&cached_input_grad);
+    vit_encoder_block_cache_free(&block_cache);
+    vit_encoder_block_free(&cached_block);
+    if (cached_failures) {
+        fprintf(stderr, "FAIL: ViT encoder block cached backward\n");
+        return 1;
+    }
+
+    ViTConfig model_config = {1, 4, 4, 2, 4, 2, 1, 2};
+    ViTModel model = {0};
+    ViTModelCache model_cache = {0};
+    float model_image[16];
+    float model_image_grad[16] = {0};
+    int model_failures = vit_model_init(&model, &model_config) != 0;
+    if (!model_failures) {
+        for (size_t i = 0; i < 16; ++i) {
+            model_image[i] = (float)(i + 1) * 0.05f;
+        }
+        model_failures =
+            vit_model_cache_init(&model_cache, &model, 1) != 0 ||
+            vit_model_forward(&model, model_image, 1, &model_cache) != 0;
+        if (!model_failures) {
+            model_cache.logits.grad[0] = 1.0f;
+            model_cache.logits.grad[1] = -1.0f;
+            model_failures = vit_model_backward(
+                &model, model_image, &model_cache, model_image_grad) != 0;
+            for (size_t i = 0; i < 16; ++i) {
+                model_failures = model_failures || !isfinite(model_image_grad[i]);
+            }
+        }
+    }
+    vit_model_cache_free(&model_cache);
+    vit_model_free(&model);
+    if (model_failures) {
+        fprintf(stderr, "FAIL: integrated ViT model\n");
+        return 1;
+    }
+
+    ViTConfig training_config = {1, 2, 2, 1, 2, 1, 1, 2};
+    ViTModel training_model = {0};
+    ViTModelCache training_cache = {0};
+    const float training_images[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    const size_t training_targets[1] = {0};
+    float first_loss = 0.0f;
+    float last_loss = 0.0f;
+    int training_failures = vit_model_init(&training_model, &training_config) != 0 ||
+        vit_model_cache_init(&training_cache, &training_model, 1) != 0;
+    if (!training_failures) {
+        for (size_t step = 0; step < 50; ++step) {
+            float loss = 0.0f;
+            training_failures = vit_model_train_batch(
+                &training_model, training_images, training_targets, 1,
+                &training_cache, 0.1f, 0.001f, &loss) != 0;
+            if (step == 0) {
+                first_loss = loss;
+            }
+            last_loss = loss;
+            if (training_failures) {
+                break;
+            }
+        }
+        training_failures = training_failures || !isfinite(first_loss) ||
+            !isfinite(last_loss) || last_loss >= first_loss;
+    }
+    if (training_failures) {
+        vit_model_cache_free(&training_cache);
+        vit_model_free(&training_model);
+        fprintf(stderr, "FAIL: ViT end-to-end training\n");
+        return 1;
+    }
+
+    const char *checkpoint_path = "build/test_vit_checkpoint.bin";
+    ViTModel restored_model = {0};
+    ViTModelCache restored_cache = {0};
+    int checkpoint_failures = vit_model_save(&training_model, checkpoint_path) != 0;
+    checkpoint_failures = checkpoint_failures ||
+        vit_model_init(&restored_model, &training_config) != 0;
+    checkpoint_failures = checkpoint_failures ||
+        vit_model_load(&restored_model, checkpoint_path) != 0;
+    checkpoint_failures = checkpoint_failures ||
+        vit_model_cache_init(&restored_cache, &restored_model, 1) != 0 ||
+        vit_model_forward(&training_model, training_images, 1,
+                          &training_cache) != 0 ||
+        vit_model_forward(&restored_model, training_images, 1,
+                          &restored_cache) != 0;
+    if (!checkpoint_failures) {
+        for (size_t i = 0; i < tensor_numel(&training_cache.logits); ++i) {
+            checkpoint_failures = checkpoint_failures ||
+                fabsf(training_cache.logits.data[i] -
+                      restored_cache.logits.data[i]) > 1e-7f;
+        }
+        checkpoint_failures = checkpoint_failures ||
+            training_model.classification_head.projection.step !=
+                restored_model.classification_head.projection.step;
+    }
+    ViTEvaluationMetrics evaluation = {0};
+    int evaluation_failures = vit_model_evaluate(
+        &training_model, training_images, training_targets, 1, &evaluation) != 0 ||
+        !isfinite(evaluation.accuracy) ||
+        !isfinite(evaluation.average_loss) ||
+        evaluation.accuracy < 0.0f || evaluation.accuracy > 1.0f ||
+        evaluation.samples_per_second < 0.0;
+    vit_model_cache_free(&restored_cache);
+    vit_model_free(&restored_model);
+    vit_model_cache_free(&training_cache);
+    vit_model_free(&training_model);
+    remove(checkpoint_path);
+    if (checkpoint_failures) {
+        fprintf(stderr, "FAIL: ViT checkpoint round-trip\n");
+        return 1;
+    }
+    if (evaluation_failures) {
+        fprintf(stderr, "FAIL: ViT evaluation\n");
         return 1;
     }
 
@@ -83,6 +289,70 @@ int main(void) {
     vit_patch_projection_free(&patch_projection);
     if (vit_failures) {
         fprintf(stderr, "FAIL: ViT patch projection\n");
+        return 1;
+    }
+
+    ViTPatchProjection gradient_projection = {0};
+    Tensor gradient_output = {0};
+    int gradient_failures = vit_patch_projection_init(
+        &gradient_projection, 1, 2, 2, 2, 1) != 0 ||
+        tensor_init(&gradient_output, 1, 1) != 0;
+    const float gradient_input[4] = {1.0f, -2.0f, 0.5f, 3.0f};
+    if (!gradient_failures) {
+        gradient_projection.projection.value.data[0] = 0.2f;
+        gradient_projection.projection.value.data[1] = -0.4f;
+        gradient_projection.projection.value.data[2] = 0.7f;
+        gradient_projection.projection.value.data[3] = 0.1f;
+        gradient_output.grad[0] = 1.0f;
+        float analytic_input_grad[4] = {0};
+        gradient_failures =
+            vit_patch_projection_forward(&gradient_projection, gradient_input,
+                                          1, &gradient_output) != 0 ||
+            vit_patch_projection_backward(&gradient_projection, gradient_input,
+                                          1, &gradient_output,
+                                          analytic_input_grad) != 0;
+        const float finite_difference = 1e-3f;
+        const float original_weight =
+            gradient_projection.projection.value.data[0];
+        gradient_projection.projection.value.data[0] =
+            original_weight + finite_difference;
+        vit_patch_projection_forward(&gradient_projection, gradient_input, 1,
+                                     &gradient_output);
+        const float positive = gradient_output.data[0];
+        gradient_projection.projection.value.data[0] =
+            original_weight - finite_difference;
+        vit_patch_projection_forward(&gradient_projection, gradient_input, 1,
+                                     &gradient_output);
+        const float negative = gradient_output.data[0];
+        gradient_projection.projection.value.data[0] = original_weight;
+        const float numerical_weight =
+            (positive - negative) / (2.0f * finite_difference);
+        const float weight_error =
+            fabsf(numerical_weight -
+                  gradient_projection.projection.value.grad[0]);
+        const float original_pixel = gradient_input[0];
+        float positive_input[4];
+        float negative_input[4];
+        memcpy(positive_input, gradient_input, sizeof(gradient_input));
+        memcpy(negative_input, gradient_input, sizeof(gradient_input));
+        positive_input[0] = original_pixel + finite_difference;
+        negative_input[0] = original_pixel - finite_difference;
+        vit_patch_projection_forward(&gradient_projection, positive_input, 1,
+                                     &gradient_output);
+        const float positive_pixel = gradient_output.data[0];
+        vit_patch_projection_forward(&gradient_projection, negative_input, 1,
+                                     &gradient_output);
+        const float negative_pixel = gradient_output.data[0];
+        const float numerical_pixel =
+            (positive_pixel - negative_pixel) / (2.0f * finite_difference);
+        gradient_failures = gradient_failures ||
+            weight_error > 1e-3f ||
+            fabsf(numerical_pixel - analytic_input_grad[0]) > 1e-3f;
+    }
+    tensor_free(&gradient_output);
+    vit_patch_projection_free(&gradient_projection);
+    if (gradient_failures) {
+        fprintf(stderr, "FAIL: ViT patch projection gradient check\n");
         return 1;
     }
 
