@@ -18,6 +18,31 @@ static int expect(int condition, const char *message) {
 }
 
 int main(void) {
+    ViTEncoderBlock encoder_block = {0};
+    Tensor block_input = {0};
+    Tensor block_output = {0};
+    int block_failures = vit_encoder_block_init(
+        &encoder_block, 4, 2, 3) != 0 ||
+        tensor_init(&block_input, 3, 4) != 0 ||
+        tensor_init(&block_output, 3, 4) != 0;
+    if (!block_failures) {
+        for (size_t i = 0; i < tensor_numel(&block_input); ++i) {
+            block_input.data[i] = (float)(i + 1) * 0.1f;
+        }
+        block_failures = vit_encoder_block_forward(
+            &encoder_block, &block_input, 1, &block_output) != 0;
+        for (size_t i = 0; i < tensor_numel(&block_output); ++i) {
+            block_failures = block_failures || !isfinite(block_output.data[i]);
+        }
+    }
+    tensor_free(&block_input);
+    tensor_free(&block_output);
+    vit_encoder_block_free(&encoder_block);
+    if (block_failures) {
+        fprintf(stderr, "FAIL: ViT encoder block forward\n");
+        return 1;
+    }
+
     ViTPatchProjection patch_projection = {0};
     Tensor patch_tokens = {0};
     int vit_failures = vit_patch_projection_init(

@@ -2,6 +2,7 @@
 #define VIT_H
 
 #include "tensor.h"
+#include "ops.h"
 
 #include <stddef.h>
 
@@ -53,5 +54,26 @@ int vit_token_embedding_forward(const ViTTokenEmbedding *embedding,
 int vit_token_embedding_backward(ViTTokenEmbedding *embedding,
                                  const Tensor *output, size_t batch,
                                  Tensor *patch_grad);
+
+typedef struct {
+    size_t d_model;
+    size_t heads;
+    size_t sequence_length;
+    Parameter query_key_value;
+    Parameter attention_output;
+    Parameter mlp_input;
+    Parameter mlp_output;
+    Parameter attention_gamma;
+    Parameter attention_beta;
+    Parameter mlp_gamma;
+    Parameter mlp_beta;
+} ViTEncoderBlock;
+
+int vit_encoder_block_init(ViTEncoderBlock *block, size_t d_model,
+                           size_t heads, size_t sequence_length);
+void vit_encoder_block_free(ViTEncoderBlock *block);
+int vit_encoder_block_forward(const ViTEncoderBlock *block,
+                              const Tensor *input, size_t batch,
+                              Tensor *output);
 
 #endif

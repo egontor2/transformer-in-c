@@ -1,5 +1,6 @@
 #include "vit.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -225,4 +226,185 @@ int vit_token_embedding_backward(ViTTokenEmbedding *embedding,
         }
     }
     return 0;
+}
+
+static int initialize_parameter(Parameter *parameter, size_t rows, size_t cols) {
+    return parameter_init(parameter, rows, cols);
+}
+
+int vit_encoder_block_init(ViTEncoderBlock *block, size_t d_model,
+                           size_t heads, size_t sequence_length) {
+    if (!block || d_model == 0 || heads == 0 || sequence_length == 0 ||
+        d_model % heads != 0) {
+        return -1;
+    }
+    memset(block, 0, sizeof(*block));
+    block->d_model = d_model;
+    block->heads = heads;
+    block->sequence_length = sequence_length;
+    if (initialize_parameter(&block->query_key_value, d_model, 3 * d_model) ||
+        initialize_parameter(&block->attention_output, d_model, d_model) ||
+        initialize_parameter(&block->mlp_input, d_model, 4 * d_model) ||
+        initialize_parameter(&block->mlp_output, 4 * d_model, d_model) ||
+        initialize_parameter(&block->attention_gamma, 1, d_model) ||
+        initialize_parameter(&block->attention_beta, 1, d_model) ||
+        initialize_parameter(&block->mlp_gamma, 1, d_model) ||
+        initialize_parameter(&block->mlp_beta, 1, d_model)) {
+        vit_encoder_block_free(block);
+        return -1;
+    }
+    for (size_t i = 0; i < d_model; ++i) {
+        block->attention_gamma.value.data[i] = 1.0f;
+        block->mlp_gamma.value.data[i] = 1.0f;
+    }
+    return 0;
+}
+
+void vit_encoder_block_free(ViTEncoderBlock *block) {
+    if (!block) {
+        return;
+    }
+    parameter_free(&block->query_key_value);
+    parameter_free(&block->attention_output);
+    parameter_free(&block->mlp_input);
+    parameter_free(&block->mlp_output);
+    parameter_free(&block->attention_gamma);
+    parameter_free(&block->attention_beta);
+    parameter_free(&block->mlp_gamma);
+    parameter_free(&block->mlp_beta);
+    memset(block, 0, sizeof(*block));
+}
+
+static int create_matrix(Tensor *tensor, size_t rows, size_t cols) {
+    return tensor_init(tensor, rows, cols);
+}
+
+static void split_attention_inputs(const Tensor *projected, Tensor *query,
+                                   Tensor *key, Tensor *value, size_t batch,
+                                   size_t sequence_length, size_t d_model,
+                                   size_t heads) {
+    const size_t head_dimension = d_model / heads;
+    for (size_t sample = 0; sample < batch; ++sample) {
+        for (size_t position = 0; position < sequence_length; ++position) {
+            const size_t source_row = sample * sequence_length + position;
+            for (size_t head = 0; head < heads; ++head) {
+                const size_t target_row =
+                    (sample * heads + head) * sequence_length + position;
+                for (size_t dimension = 0; dimension < head_dimension; ++dimension) {
+                    const size_t offset = head * head_dimension + dimension;
+                    query->data[target_row * head_dimension + dimension] =
+                        projected->data[source_row * (3 * d_model) + offset];
+                    key->data[target_row * head_dimension + dimension] =
+                        projected->data[source_row * (3 * d_model) + d_model + offset];
+                    value->data[target_row * head_dimension + dimension] =
+                        projected->data[source_row * (3 * d_model) + 2 * d_model + offset];
+                }
+            }
+        }
+    }
+}
+
+static void merge_attention_output(const Tensor *attention, Tensor *merged,
+                                   size_t batch, size_t sequence_length,
+                                   size_t d_model, size_t heads) {
+    const size_t head_dimension = d_model / heads;
+    for (size_t sample = 0; sample < batch; ++sample) {
+        for (size_t position = 0; position < sequence_length; ++position) {
+            const size_t output_row = sample * sequence_length + position;
+            for (size_t head = 0; head < heads; ++head) {
+                const size_t source_row =
+                    (sample * heads + head) * sequence_length + position;
+                for (size_t dimension = 0; dimension < head_dimension; ++dimension) {
+                    merged->data[output_row * d_model + head * head_dimension +
+                                 dimension] =
+                        attention->data[source_row * head_dimension + dimension];
+                }
+            }
+        }
+    }
+}
+
+int vit_encoder_block_forward(const ViTEncoderBlock *block,
+                              const Tensor *input, size_t batch,
+                              Tensor *output) {
+    if (!block || !input || !output || batch == 0 ||
+        input->ndim != 2 || output->ndim != 2 ||
+        input->rows != batch * block->sequence_length ||
+        output->rows != input->rows || input->cols != block->d_model ||
+        output->cols != block->d_model) {
+        return -1;
+    }
+    const size_t rows = batch * block->sequence_length;
+    const size_t head_dimension = block->d_model / block->heads;
+    const size_t attention_rows = batch * block->heads * block->sequence_length;
+    Tensor normalized_attention = {0};
+    Tensor projected = {0};
+    Tensor query = {0};
+    Tensor key = {0};
+    Tensor value = {0};
+    Tensor probabilities = {0};
+    Tensor attended = {0};
+    Tensor merged = {0};
+    Tensor attention_residual = {0};
+    Tensor mlp_residual = {0};
+    Tensor normalized_mlp = {0};
+    Tensor hidden = {0};
+    Tensor activated = {0};
+    int result = create_matrix(&normalized_attention, rows, block->d_model) ||
+        create_matrix(&projected, rows, 3 * block->d_model) ||
+        create_matrix(&query, attention_rows, head_dimension) ||
+        create_matrix(&key, attention_rows, head_dimension) ||
+        create_matrix(&value, attention_rows, head_dimension) ||
+        create_matrix(&probabilities, attention_rows, block->sequence_length) ||
+        create_matrix(&attended, attention_rows, head_dimension) ||
+        create_matrix(&merged, rows, block->d_model) ||
+        create_matrix(&attention_residual, rows, block->d_model) ||
+        create_matrix(&mlp_residual, rows, block->d_model) ||
+        create_matrix(&normalized_mlp, rows, block->d_model) ||
+        create_matrix(&hidden, rows, 4 * block->d_model) ||
+        create_matrix(&activated, rows, 4 * block->d_model);
+    if (result == 0) {
+        result = ops_layer_norm(input, &block->attention_gamma.value,
+                                &block->attention_beta.value, 1e-5f,
+                                &normalized_attention) ||
+            ops_gemm(&normalized_attention, &block->query_key_value.value,
+                     &projected);
+    }
+    if (result == 0) {
+        split_attention_inputs(&projected, &query, &key, &value, batch,
+                               block->sequence_length, block->d_model,
+                               block->heads);
+        result = ops_multi_head_attention(
+            &query, &key, &value, batch, block->heads,
+            block->sequence_length, 1.0f / sqrtf((float)head_dimension),
+            &probabilities, &attended);
+    }
+    if (result == 0) {
+        merge_attention_output(&attended, &merged, batch,
+                               block->sequence_length, block->d_model,
+                               block->heads);
+        result = ops_gemm(&merged, &block->attention_output.value,
+                          &mlp_residual) ||
+            ops_residual(input, &mlp_residual, &attention_residual) ||
+            ops_layer_norm(&attention_residual, &block->mlp_gamma.value,
+                           &block->mlp_beta.value, 1e-5f, &normalized_mlp) ||
+            ops_gemm(&normalized_mlp, &block->mlp_input.value, &hidden) ||
+            ops_gelu(&hidden, &activated) ||
+            ops_gemm(&activated, &block->mlp_output.value, &mlp_residual) ||
+            ops_residual(&attention_residual, &mlp_residual, output);
+    }
+    tensor_free(&normalized_attention);
+    tensor_free(&projected);
+    tensor_free(&query);
+    tensor_free(&key);
+    tensor_free(&value);
+    tensor_free(&probabilities);
+    tensor_free(&attended);
+    tensor_free(&merged);
+    tensor_free(&attention_residual);
+    tensor_free(&mlp_residual);
+    tensor_free(&normalized_mlp);
+    tensor_free(&hidden);
+    tensor_free(&activated);
+    return result;
 }
