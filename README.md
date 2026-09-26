@@ -1,287 +1,229 @@
-# Transformer en C
+# transformer-in-c
 
-Implementación inicial de un bloque **Transformer encoder** en C99, sin
-dependencias externas. El modelo incluye:
+Vision Transformer (ViT) escrito desde cero en C99, sin librerías de deep
+learning, con entrenamiento completo en GPU mediante un backend Metal (Apple
+Silicon) o CUDA (NVIDIA). El modelo se entrena y evalúa sobre
+[OrganSMNIST](https://medmnist.com/) (MedMNIST v2): 11 órganos en cortes
+sagitales de TAC abdominal de 28×28 píxeles.
 
-- Layer normalization pre-norm.
-- Multi-head self-attention escalada.
-- Proyección QKV y proyección de salida.
-- Feed-forward network con activación ReLU.
-- Múltiples capas encoder y conexiones residuales.
-- Entrada visual mediante patch embedding configurable.
-- API ViT con token `[CLS]`, posiciones aprendibles, bloque Pre-LN y cabeza
-  lineal de clasificación.
-- Cache de activaciones y backward completo del bloque ViT, incluyendo biases
-  affine, atención bidireccional y MLP GELU.
-- `ViTModel` entrenable end-to-end: patch projection, embeddings, bloques,
-  LayerNorm final y clasificación sobre `[CLS]`.
-- `vit_model_train_batch` conecta cross-entropy, backward y AdamW sobre todo
-  el backbone y la cabeza.
-- `vit_model_save` y `vit_model_load` guardan configuración, pesos, momentos
-  AdamW y contador de pasos en checkpoints binarios versionados.
-- `vit_model_clip_gradients` aplica clipping global por norma antes de cada
-  actualización AdamW del entrenamiento end-to-end.
-- `vit_model_evaluate` calcula accuracy, cross-entropy media y throughput de
-  inferencia mediante un benchmark reproducible sobre un batch.
-- Backend opcional MPS para GEMM en macOS/Apple Silicon, aislado mediante ABI C
-  y Objective-C++.
-- Codificación posicional sinusoidal para los patches.
-- Cabeza de clasificación y entrenamiento SGD con entropía cruzada.
-- Loop de entrenamiento para datasets en memoria.
+Todo el pipeline es propio: tensores, autodiferenciación manual de cada capa,
+AdamW, aumentación de datos, scheduler, checkpoints, evaluación con ensemble y
+test-time augmentation, y los kernels de GPU. La implementación en C sirve
+además como referencia numérica: cada kernel de GPU se valida contra ella.
 
-Los tensores de entrada y salida usan layout row-major:
-`[sequence_length][d_model]`.
+## Resultados
 
-## Compilar y ejecutar
+Partición oficial de MedMNIST (13 932 / 2 452 / 8 827 imágenes). Los modelos y
+los hiperparámetros se eligen por validación; test solo se usa para informar.
 
-```sh
-make
-make run
-make test
-```
+| Modelo | Parámetros | Test acc. | Acc. equilibrada | Macro-F1 |
+|---|---:|---:|---:|---:|
+| ViT-C, patch 4, d=128, 4 capas | 0.80 M | 78.4 % | 0.746 | 0.750 |
+| Ensemble de 2 ViT-C + TTA 5 vistas | 2 × 0.80 M | **79.9 %** | **0.758** | **0.763** |
+| ResNet-18 (28×28), referencia MedMNIST v2 | 11 M | 78.2 % | — | — |
 
-La API pública está en `include/transformer.h`. Para visión, configura
-`patch_size` e `input_channels` y llama a `transformer_forward_image`. La
-imagen debe estar en layout `[height][width][channels]`; se divide en patches
-no solapados y cada patch se proyecta a `d_model`.
+Cada época de entrenamiento tarda unos 8 s en un MacBook con chip M3 (GPU
+integrada). Casi el 40 % de los errores se concentra en los pares
+fémur izquierdo/derecho y riñón izquierdo/derecho, que en un corte sagital no
+se distinguen por el contenido de la imagen. La memoria en
+[`paper/`](paper/) documenta el proyecto, los experimentos y la comparación
+con modelos preentrenados en PyTorch.
 
-La cabeza de clasificación se activa con `n_classes`. El entrenamiento se
-realiza con `transformer_train_image`, que actualiza la cabeza mediante SGD y
-entropía cruzada sobre el promedio de los tokens codificados. En esta primera
-iteración el encoder se usa como backbone congelado; el siguiente paso será
-añadir backpropagation completa para ajustar también sus pesos.
+## Características
 
-Para varias imágenes puede usarse `transformer_train_dataset`, con un buffer
-contiguo `[sample][height][width][channels]` y un vector de etiquetas.
+**Modelo**
+- ViT Pre-LN: patch embedding, token `[CLS]`, posiciones aprendibles,
+  atención multi-cabeza bidireccional, MLP con GELU y LayerNorm final.
+- Backward escrito a mano para cada operación, verificado con diferencias
+  finitas.
+- AdamW con weight decay desacoplado, clipping global por norma y label
+  smoothing.
 
-También se incluye `include/dataset.h`, un cargador de manifests CSV con
-imágenes PGM (`P2` o `P5`):
+**Entrenamiento y evaluación**
+- Warmup lineal y schedulers `cosine`, `plateau` y `constant`; early stopping
+  y reanudación completa (pesos, momentos de AdamW y estado del scheduler).
+- Normalización con estadísticas de entrenamiento.
+- Aumentación que conserva la orientación anatómica (sin volteos):
+  traslación, rotación, escala, brillo, contraste, ruido gaussiano y random
+  erasing.
+- Pesos por clase para datasets desbalanceados.
+- Ensemble de checkpoints (con arquitecturas distintas) y TTA con 1, 5 o 9
+  vistas desplazadas.
+- Métricas por clase, precisión equilibrada, macro-F1 y matriz de confusión.
+
+**Aceleración**
+- CPU: implementación de referencia; en macOS las operaciones se paralelizan
+  con GCD.
+- Metal (macOS): el paso de entrenamiento completo se encola en la GPU y se
+  sincroniza una sola vez por batch. GEMM con Metal Performance Shaders;
+  el resto con kernels propios (`src/metal_kernels.metal`), incluida una
+  atención por bloques tipo FlashAttention para secuencias largas.
+- CUDA (NVIDIA): el mismo diseño con cuBLAS y kernels CUDA
+  (`src/cuda_backend.cu`). Véase el [estado del backend CUDA](#estado-del-backend-cuda).
+
+## Estructura
 
 ```text
-data/cat_001.pgm,0
-data/dog_001.pgm,1
+include/            API pública (tensor.h, ops.h, vit.h, augmentation.h, ...)
+src/
+  autodiff.c        tensores, parámetros y allocator configurable
+  ops.c             operaciones con implementación CPU y despacho a GPU
+  vit.c             modelo ViT, entrenamiento, checkpoints y evaluación
+  augmentation.c    aumentación de datos
+  dataset.c         cargador de manifiestos CSV con imágenes PGM
+  mps_backend.mm    backend Metal/MPS
+  metal_kernels.metal
+  cuda_backend.cu   backend CUDA/cuBLAS
+examples/
+  organ_smnist.c    entrenamiento y evaluación sobre OrganSMNIST
+tests/
+  test_vision.c     tests de la ruta CPU (incluye gradient checking)
+  test_device.c     compara CPU y GPU (Metal o CUDA) paso a paso
+scripts/            conversión de OrganSMNIST a PGM y análisis de datos
+paper/              memoria del proyecto (LaTeX)
 ```
 
-`vision_dataset_load_pgm_csv` devuelve los píxeles normalizados a `[0, 1]`,
-listos para pasarlos a `transformer_train_dataset`.
+## Compilación
 
-### Probar con OrganSMNIST
+Requisitos: un compilador C99 y `make`. Para Metal, macOS con Xcode Command
+Line Tools. Para CUDA, el CUDA Toolkit (11.5 o superior) y una GPU NVIDIA con
+memoria gestionada (Pascal o posterior).
 
-OrganSMNIST de MedMNIST se distribuye como un `.npz` con las claves
-`train_images`, `train_labels`, `val_images`, `val_labels`, `test_images` y
-`test_labels`. El repositorio incluye un conversor que evita añadir un parser
-NPZ al runtime C:
+```sh
+make                          # librería, ejemplo CPU y ejemplo básico
+make test                     # tests de la ruta CPU
+
+make build/organ_smnist_mps   # macOS: entrenamiento en GPU con Metal
+make metal-test               # compara CPU y Metal
+
+make build/organ_smnist_cuda  # Linux + NVIDIA: entrenamiento con CUDA
+make cuda-test                # compara CPU y CUDA
+```
+
+Para CUDA, `CUDA_HOME` (por defecto `/usr/local/cuda`) y `CUDA_ARCH` (por
+defecto `native`) pueden ajustarse, por ejemplo
+`make build/organ_smnist_cuda CUDA_ARCH=sm_86`.
+
+## Datos
+
+OrganSMNIST se distribuye como `organsmnist.npz`. El conversor genera
+imágenes PGM y los manifiestos `train.csv`, `val.csv` y `test.csv`:
 
 ```sh
 python3 -m pip install numpy
-python3 scripts/organ_smnist_to_pgm.py organmnist.npz data/organ_smnist
+python3 scripts/organ_smnist_to_pgm.py organsmnist.npz data/organ_smnist
 ```
 
-Esto genera `train.csv`, `val.csv`, `test.csv` y ficheros PGM grayscale de
-28x28. El modelo ViT debe configurarse con `channels=1`, `height=28`,
-`width=28`, `patch_size` divisor de 28 (por ejemplo 4), y `classes=11`.
-Después, carga el split con `vision_dataset_load_pgm_csv`; sus imágenes están
-aplanadas por muestra en el orden `[channel][height][width]`, que coincide con
-la entrada NCHW de `vit_model_train_batch` y `vit_model_evaluate`.
-El entrenamiento se realiza por batches contiguos: crea un
-`ViTModelCache` del tamaño del batch, llama a `vit_model_train_batch` para cada
-segmento de `images` y `labels`, y usa `vit_model_evaluate` sobre validación o
-test. Para el primer experimento conviene usar `d_model=64`, `heads=4`,
-`layers=2` y `patch_size=4`; el modelo resultante tiene 49 tokens por imagen.
+Si los datos están en carpetas por clase (`train/0`, `train/1`, ...), usa
+`scripts/images_to_pgm.py` (requiere Pillow).
 
-El flujo completo está disponible en `examples/organ_smnist.c`:
+## Entrenamiento
 
-```sh
-make organ-smnist
-./build/organ_smnist data/organ_smnist/train.csv \
-  data/organ_smnist/val.csv data/organ_smnist/test.csv \
-  build/organ_smnist.vit
-```
-
-El ejemplo mezcla el dataset con una semilla fija al principio de cada época.
-Solo `train.csv` actualiza los pesos, `val.csv` selecciona y conserva el mejor
-checkpoint, y `test.csv` se consulta una sola vez al final. Los valores por defecto son
-batches completos de 32 muestras, cinco épocas, `learning_rate=0.0001` y
-`weight_decay=0.01`. Se pueden ajustar:
-
-```sh
-./build/organ_smnist TRAIN.csv VAL.csv TEST.csv CHECKPOINT \
-  BATCH EPOCHS LR DECAY WARMUP_EPOCHS SCHEDULER PATIENCE FACTOR [RESUME] [EARLY_STOPPING]
-```
-
-El entrenamiento usa por defecto una época de warmup lineal y
-`ReduceLROnPlateau`: reduce el learning rate cuando la pérdida de validación no
-mejora. `SCHEDULER` puede ser `plateau`, `cosine` o `constant`; los valores por
-defecto son `PATIENCE=2` y `FACTOR=0.5`. Para desactivar el warmup usa `0`.
-
-Para reanudar desde un checkpoint existente, añade su ruta como último
-argumento. Se restauran los pesos, estados `m/v` y contadores de AdamW:
-
-```sh
-./build/organ_smnist_mps TRAIN.csv VAL.csv TEST.csv \
-  build/organ_smnist.mps.vit 32 10 0.0001 0.01 1 plateau 2 0.5 \
-  build/organ_smnist.mps.vit
-```
-
-El entrenamiento guarda además `CHECKPOINT.state` con la época del mejor
-checkpoint, el learning rate efectivo, la mejor `val_loss` y el estado de
-`ReduceLROnPlateau`. Al usar `--resume`, ese fichero se restaura junto con los
-pesos; si falta, se mantienen los valores proporcionados por CLI.
-
-Al reanudar no se repite el warmup. Para forzar deliberadamente otro learning
-rate inicial usa `--resume-lr`, por ejemplo `--resume-lr 0.00001`.
-
-También se puede usar la forma nombrada, recomendada para no depender del
-orden de los argumentos:
+Configuración con la que se obtienen los resultados de la tabla (sustituye
+`organ_smnist_mps` por `organ_smnist_cuda` u `organ_smnist` según el backend):
 
 ```sh
 ./build/organ_smnist_mps \
   --train data/organ_smnist/train.csv \
   --val data/organ_smnist/val.csv \
   --test data/organ_smnist/test.csv \
-  --checkpoint build/organ_smnist.mps.continued.vit \
-  --batch 32 --epochs 20 --lr 0.0001 --weight-decay 0.01 \
-  --warmup 1 --scheduler plateau --patience 2 --factor 0.5 \
-  --resume build/organ_smnist.mps.vit --early-stopping 6
+  --checkpoint build/vit.ckpt \
+  --batch 32 --epochs 50 --lr 0.001 --weight-decay 0.05 \
+  --warmup 5 --scheduler cosine --early-stopping 15 \
+  --patch-size 4 --d-model 128 --heads 8 --layers 4 \
+  --augment standard --label-smoothing 0.1 \
+  --metrics-csv build/vit.metrics.csv
 ```
 
-`--early-stopping N` detiene el entrenamiento después de `N` épocas sin
-mejora de `val_loss`; `0` lo desactiva.
+El checkpoint guarda el mejor modelo según la pérdida de validación. Al
+terminar se evalúa sobre test y se imprimen las métricas por clase y la matriz
+de confusión.
 
-Al finalizar también se imprime la accuracy por clase del split de test, lo
-que permite detectar clases que el accuracy global oculta.
+| Opción | Descripción |
+|---|---|
+| `--patch-size`, `--d-model`, `--heads`, `--layers` | Arquitectura (patch_size debe dividir 28; d_model, ser múltiplo de heads) |
+| `--batch`, `--epochs`, `--lr`, `--weight-decay` | Optimización |
+| `--warmup N`, `--scheduler plateau\|cosine\|constant`, `--patience`, `--factor` | Planificación del learning rate |
+| `--early-stopping N` | Parar tras N épocas sin mejorar la pérdida de validación (0 lo desactiva) |
+| `--resume CKPT`, `--resume-lr VALUE` | Reanudar desde un checkpoint |
+| `--augment standard` | Preset de aumentación; cada parámetro se ajusta con `--max-shift`, `--max-rotation`, `--max-scale`, `--brightness`, `--contrast`, `--noise-std`, `--erasing-prob`, `--erasing-size` |
+| `--label-smoothing VALUE` | Label smoothing en la pérdida de entrenamiento |
+| `--class-weights balanced` | Pesos inversamente proporcionales a la frecuencia de clase |
+| `--seed N` | Semilla de inicialización, barajado y aumentación |
+| `--metrics-csv PATH` | Métricas por época |
 
-`--metrics-csv PATH` guarda las métricas de cada época (`learning_rate`,
-`train_loss`, `val_accuracy` y `val_loss`) para comparar ejecuciones y
-graficar la convergencia.
+## Evaluación: ensemble y TTA
 
-Para compensar desbalance de clases puede usarse
-`--class-weights balanced`; calcula pesos inversamente proporcionales a la
-frecuencia del split de entrenamiento.
-
-No se activa aumentación geométrica automáticamente: OrganSMNIST incluye clases
-laterales (`left`/`right`) y un flip horizontal puede cambiar la etiqueta
-anatómica. Una futura aumentación debe ser consciente de la lateralidad y
-validarse por clase antes de usarse en entrenamiento.
-
-Si el número de muestras no es múltiplo del batch, descarta únicamente el
-último batch incompleto; esto mantiene el cache de activaciones con tamaño
-fijo. La mezcla es importante porque los manifests generados por carpetas
-agrupan inicialmente todas las imágenes de una clase.
-El checkpoint se selecciona por la menor `val_loss` de `val.csv`, alineado con
-`ReduceLROnPlateau` y early stopping; después se restaura ese checkpoint y se
-informa `test.csv` una sola vez como métrica final.
-
-Si el ZIP de Kaggle contiene imágenes en carpetas `train/0`, `train/1`, etc.,
-usa el conversor alternativo:
+`--ensemble` evalúa checkpoints sin entrenar y promedia sus probabilidades.
+Cada checkpoint guarda su arquitectura, así que se pueden mezclar modelos de
+tamaños distintos. `--tta 5` añade las cuatro traslaciones de un píxel de cada
+imagen; `--tta 9`, también las diagonales.
 
 ```sh
-python3 -m pip install pillow
-python3 scripts/images_to_pgm.py data/organsmnist_raw data/organ_smnist
+./build/organ_smnist_mps \
+  --ensemble build/vit_seed1.ckpt,build/vit_seed2.ckpt --tta 5
 ```
 
-La misma estructura debe existir para `val` y `test`. Si Kaggle solo incluye
-`train` y `test`, ejecuta `--splits train test` y reserva una parte del train
-para validación antes de entrenar. Las imágenes se convierten a grayscale
-28x28 y las etiquetas se asignan según el orden numérico de las carpetas.
+Se informan las métricas de validación y test de cada modelo y del ensemble.
+Elige la combinación por validación.
 
-## Fase 1: núcleo de tensores
+## Aceleración por GPU
 
-La base de entrenamiento desde cero está organizada en:
+Los dos backends siguen el mismo diseño:
 
-- `include/tensor.h`: `Tensor` contiguo con `data`, `grad`, shape y strides;
-  además de `Parameter` con buffers para AdamW.
-- `include/arena.h`: bump allocator para activaciones temporales, con
-  `arena_reset` entre iteraciones.
-- `include/ops.h`: GEMM, GEMM con la izquierda transpuesta, residuales y sus
-  pases backward acumulativos, LayerNorm, GELU, softmax + cross-entropy y
-  AdamW, además de suma de bias y backward. También incluye atención causal y
-  atención multi-head bidireccional, con backward explícito para Q, K y V.
+1. **Memoria compartida.** Al activar el backend, `tensor_init` reserva cada
+   tensor (pesos, activaciones, gradientes y momentos de AdamW) en memoria
+   accesible desde CPU y GPU: `MTLBuffer` compartido en Metal y
+   `cudaMallocManaged` en CUDA.
+2. **Despacho por operación.** Cada función de `ops.h` consulta el
+   `OpsDeviceBackend` instalado. Si todos sus tensores están en memoria de
+   dispositivo, encola el kernel sin esperar; si no, sincroniza y ejecuta la
+   versión C, que es la referencia.
+3. **Una sincronización por paso.** Un paso de entrenamiento completo
+   (patches, embeddings, bloques, pérdida, backward, clipping y AdamW) se
+   encola entero y solo se sincroniza al leer la pérdida.
 
-Las operaciones devuelven `0` si tienen shapes compatibles y `-1` ante una
-forma inválida. `ViTEncoderBlockCache` conserva las activaciones necesarias
-para `vit_encoder_block_backward`; los gradientes se acumulan y deben
-reinicializarse con `tensor_zero_grad` o `parameter_zero_grad` antes de cada
-iteración. AdamW ya está disponible mediante `ops_adamw_step`.
+| | Metal | CUDA |
+|---|---|---|
+| GEMM | `MPSMatrixMultiplication` | cuBLAS `cublasSgemm` |
+| Cola | command buffer pendiente | `cudaStream_t` |
+| Reducciones | SIMD-groups de 32 hilos | warps |
+| Parámetros agrupados | tabla de `gpuAddress` | tabla de punteros |
 
-La ruta nueva se configura con `ViTConfig` y se ejecuta con
-`vit_model_cache_init`, `vit_model_forward` y `vit_model_backward`. Las
-imágenes usan layout NCHW `[batch][channel][height][width]`; la pérdida puede
-calcularse sobre `cache.logits` con `ops_softmax_cross_entropy` antes del
-backward. `ViTModel` mantiene la API legacy separada para no mezclar su
-promedio de tokens ni su encoder congelado con el camino ViT.
-El paso de entrenamiento usa weight decay únicamente en matrices de pesos;
-biases, parámetros de LayerNorm, `[CLS]` y posiciones quedan sin decay.
-Los checkpoints requieren cargar sobre un `ViTModel` con la misma configuración;
-la API rechaza archivos incompatibles o truncados.
-La inicialización del modelo es determinista y la evaluación no modifica
-parámetros ni estados del optimizador.
+La atención elige entre tres kernels según el tamaño: uno con toda la
+secuencia en memoria compartida (patch 4, 50 tokens), uno por bloques tipo
+FlashAttention (patch 2, 197 tokens) y uno genérico para dimensiones de
+cabeza mayores de 64.
 
-## Aceleración MPS en macOS
+### Estado del backend CUDA
 
-El backend opcional `mps_backend` usa `MPSMatrixMultiplication` sobre buffers
-Metal compartidos. El núcleo C y la ruta CPU no dependen de frameworks Apple:
+El backend CUDA replica el de Metal kernel a kernel, pero se ha desarrollado
+en un Mac sin GPU NVIDIA: compila sin errores ni avisos en sus dos lados
+(host y device) con el soporte CUDA de clang, pero todavía no se ha compilado
+con `nvcc` ni ejecutado sobre hardware NVIDIA. Antes de usarlo, ejecuta
+`make cuda-test`, que entrena el mismo modelo en CPU y en GPU y compara la
+pérdida y los gradientes de todos los parámetros.
+
+## Tests
 
 ```sh
-make mps-test
+make test         # ruta CPU: operaciones, gradient checking, entrenamiento
+make metal-test   # CPU frente a Metal
+make cuda-test    # CPU frente a CUDA
+make mps-test     # GEMM de MPS frente a CPU
 ```
 
-El target compila `src/mps_backend.mm`, enlaza Foundation, Metal y
-MetalPerformanceShaders, y ejecuta una comprobación numérica. Si no existe
-GPU Metal, `mps_backend_create` devuelve disponibilidad no soportada en lugar
-de producir resultados parciales.
+`test_device.c` cubre los tres caminos de la atención (memoria compartida,
+por bloques y genérico) y compara pérdida, gradientes y trayectoria de
+entrenamiento con la implementación C.
 
-Esta integración expone GEMM explícitamente; el binario CPU continúa disponible
-como referencia y el binario MPS activa el dispatch durante el entrenamiento.
-El backend reutiliza buffers compartidos por clave `(filas, columnas
-interiores, columnas resultado)`, con un límite de 16 formas para evitar un
-crecimiento ilimitado. Los datos siguen copiándose en cada llamada y la
-operación espera síncronamente a la GPU.
+## Limitaciones
 
-Para entrenar con el dispatch MPS activo usa el binario específico de macOS:
+- Solo precisión simple (fp32).
+- Los datos se cargan desde PGM; no hay lector de `.npz` en C.
+- El entrenamiento es de un solo proceso y una sola GPU.
+- El backend CUDA no se ha validado todavía en hardware NVIDIA.
 
-```sh
-make build/organ_smnist_mps
-caffeinate -dismu ./build/organ_smnist_mps \
-  data/organ_smnist/train.csv \
-  data/organ_smnist/val.csv \
-  data/organ_smnist/test.csv \
-  build/organ_smnist.mps.vit \
-  32 5 0.0001 0.01
-```
+## Licencia
 
-Este binario instala MPS antes del primer `vit_model_train_batch` y lo mantiene
-activo durante entrenamiento y evaluación. Las multiplicaciones GEMM forward y
-las dos multiplicaciones del backward (`dA = dC·Bᵀ`, `dB = Aᵀ·dC`) pasan por
-`MPSMatrixMultiplication`; operaciones no GEMM permanecen en C como fallback.
-La ruta sigue siendo síncrona y copia operandos por operación, por lo que es una
-aceleración funcional y no todavía una residencia completa del modelo en GPU.
-
-La arquitectura objetivo sigue el patrón habitual de MPS:
-
-1. Crear `MTLBuffer` persistentes para pesos, activaciones, gradientes y estados
-   del optimizador.
-2. Construir `MPSMatrix` sobre esos buffers y reutilizar sus descriptores.
-3. Encadenar operaciones en un mismo `MTLCommandBuffer` sin sincronizar con la
-   CPU entre cada GEMM.
-4. Usar `MPSGraph` para el bloque ViT completo cuando las formas sean estáticas,
-   incluyendo atención, LayerNorm, activaciones y backward. Esto todavía no
-   está implementado en este backend.
-5. Descargar únicamente las métricas, checkpoints o resultados solicitados.
-
-La migración requiere añadir referencias de dispositivo a los tensores y una
-política explícita de sincronización CPU/GPU; no es correcto simularla copiando
-cada `Tensor` a un buffer temporal.
-
-El backend actual reutiliza buffers Metal por forma GEMM, reduciendo
-allocaciones repetidas. Todavía copia los datos CPU↔Metal y espera cada
-command buffer; la residencia completa de activaciones y la ejecución
-asíncrona siguen siendo trabajo futuro.
-
-La API `ops_set_gemm_backend` permite probar el dispatch MPS en operaciones GEMM
-del núcleo sin enlazar Metal en la librería CPU. Es un backend global y debe
-instalarse solo alrededor de trabajo de un único hilo; `ops_reset_gemm_backend`
-restaura la implementación C. La ruta MPS actual es síncrona y copia cada operando, aunque reutiliza las
-asignaciones Metal por forma. Sirve como integración funcional y benchmark, no
-como residencia completa del modelo en GPU ni como implementación de
-`MPSGraph`.
+Distribuido bajo la licencia MIT. Véase [`LICENSE`](LICENSE).
