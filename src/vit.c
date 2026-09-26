@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 199309L
+
 #include "vit.h"
 
 #include <math.h>
@@ -48,6 +50,7 @@ void vit_patch_projection_free(ViTPatchProjection *projection) {
 int vit_patch_projection_forward(const ViTPatchProjection *projection,
                                  const float *input, size_t batch,
                                  Tensor *output) {
+    ops_synchronize();
     if (!projection || !input || !output || batch == 0 ||
         output->ndim != 2 ||
         output->rows != batch * projection->patch_count ||
@@ -94,6 +97,7 @@ int vit_patch_projection_forward(const ViTPatchProjection *projection,
 int vit_patch_projection_backward(ViTPatchProjection *projection,
                                   const float *input, size_t batch,
                                   const Tensor *output, float *input_grad) {
+    ops_synchronize();
     if (!projection || !input || !output || !input_grad || batch == 0 ||
         output->ndim != 2 ||
         output->rows != batch * projection->patch_count ||
@@ -170,6 +174,7 @@ void vit_token_embedding_free(ViTTokenEmbedding *embedding) {
 int vit_token_embedding_forward(const ViTTokenEmbedding *embedding,
                                 const Tensor *patch_tokens, size_t batch,
                                 Tensor *output) {
+    ops_synchronize();
     if (!embedding || !patch_tokens || !output || batch == 0 ||
         patch_tokens->ndim != 2 || output->ndim != 2 ||
         patch_tokens->rows != batch * embedding->patch_count ||
@@ -200,6 +205,7 @@ int vit_token_embedding_forward(const ViTTokenEmbedding *embedding,
 int vit_token_embedding_backward(ViTTokenEmbedding *embedding,
                                  const Tensor *output, size_t batch,
                                  Tensor *patch_grad) {
+    ops_synchronize();
     if (!embedding || !output || !patch_grad || batch == 0 ||
         output->ndim != 2 || patch_grad->ndim != 2 ||
         output->rows != batch * (embedding->patch_count + 1) ||
@@ -234,13 +240,45 @@ static int initialize_parameter(Parameter *parameter, size_t rows, size_t cols) 
     return parameter_init(parameter, rows, cols);
 }
 
-static void initialize_parameter_values(Parameter *parameter, float scale,
-                                        size_t seed) {
+static uint64_t splitmix64_next(uint64_t *state) {
+    uint64_t mixed = (*state += 0x9E3779B97F4A7C15ULL);
+    mixed = (mixed ^ (mixed >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    mixed = (mixed ^ (mixed >> 27)) * 0x94D049BB133111EBULL;
+    return mixed ^ (mixed >> 31);
+}
+
+static float random_open_unit(uint64_t *state) {
+    return ((float)(splitmix64_next(state) >> 40) + 0.5f) / 16777216.0f;
+}
+
+static float random_standard_normal(uint64_t *state) {
+    const float two_pi = 6.28318530717958647692f;
+    const float radius = sqrtf(-2.0f * logf(random_open_unit(state)));
+    return radius * cosf(two_pi * random_open_unit(state));
+}
+
+static void initialize_xavier_uniform(Parameter *parameter, uint64_t *state) {
+    const float fan_in = (float)parameter->value.rows;
+    const float fan_out = (float)parameter->value.cols;
+    const float limit = sqrtf(6.0f / (fan_in + fan_out));
     const size_t count = tensor_numel(&parameter->value);
     for (size_t index = 0; index < count; ++index) {
-        const size_t value = (index * 1103515245u + seed * 12345u) & 0x7fffffff;
         parameter->value.data[index] =
-            scale * ((float)value / 1073741824.0f - 1.0f);
+            limit * (2.0f * random_open_unit(state) - 1.0f);
+    }
+}
+
+static void initialize_truncated_normal(Parameter *parameter,
+                                        float standard_deviation,
+                                        uint64_t *state) {
+    const float truncation_bound = 2.0f;
+    const size_t count = tensor_numel(&parameter->value);
+    for (size_t index = 0; index < count; ++index) {
+        float sample = random_standard_normal(state);
+        while (fabsf(sample) > truncation_bound) {
+            sample = random_standard_normal(state);
+        }
+        parameter->value.data[index] = standard_deviation * sample;
     }
 }
 
@@ -299,51 +337,6 @@ static int create_matrix(Tensor *tensor, size_t rows, size_t cols) {
     return tensor_init(tensor, rows, cols);
 }
 
-static void split_attention_inputs(const Tensor *projected, Tensor *query,
-                                   Tensor *key, Tensor *value, size_t batch,
-                                   size_t sequence_length, size_t d_model,
-                                   size_t heads) {
-    const size_t head_dimension = d_model / heads;
-    for (size_t sample = 0; sample < batch; ++sample) {
-        for (size_t position = 0; position < sequence_length; ++position) {
-            const size_t source_row = sample * sequence_length + position;
-            for (size_t head = 0; head < heads; ++head) {
-                const size_t target_row =
-                    (sample * heads + head) * sequence_length + position;
-                for (size_t dimension = 0; dimension < head_dimension; ++dimension) {
-                    const size_t offset = head * head_dimension + dimension;
-                    query->data[target_row * head_dimension + dimension] =
-                        projected->data[source_row * (3 * d_model) + offset];
-                    key->data[target_row * head_dimension + dimension] =
-                        projected->data[source_row * (3 * d_model) + d_model + offset];
-                    value->data[target_row * head_dimension + dimension] =
-                        projected->data[source_row * (3 * d_model) + 2 * d_model + offset];
-                }
-            }
-        }
-    }
-}
-
-static void merge_attention_output(const Tensor *attention, Tensor *merged,
-                                   size_t batch, size_t sequence_length,
-                                   size_t d_model, size_t heads) {
-    const size_t head_dimension = d_model / heads;
-    for (size_t sample = 0; sample < batch; ++sample) {
-        for (size_t position = 0; position < sequence_length; ++position) {
-            const size_t output_row = sample * sequence_length + position;
-            for (size_t head = 0; head < heads; ++head) {
-                const size_t source_row =
-                    (sample * heads + head) * sequence_length + position;
-                for (size_t dimension = 0; dimension < head_dimension; ++dimension) {
-                    merged->data[output_row * d_model + head * head_dimension +
-                                 dimension] =
-                        attention->data[source_row * head_dimension + dimension];
-                }
-            }
-        }
-    }
-}
-
 int vit_encoder_block_forward(const ViTEncoderBlock *block,
                               const Tensor *input, size_t batch,
                               Tensor *output) {
@@ -391,19 +384,19 @@ int vit_encoder_block_forward(const ViTEncoderBlock *block,
                      &projected);
     }
     if (result == 0) {
-        split_attention_inputs(&projected, &query, &key, &value, batch,
-                               block->sequence_length, block->d_model,
-                               block->heads);
-        result = ops_multi_head_attention(
+        result = ops_split_heads(&projected, &query, &key, &value, batch,
+                                 block->sequence_length, block->d_model,
+                                 block->heads) ||
+            ops_multi_head_attention(
             &query, &key, &value, batch, block->heads,
             block->sequence_length, 1.0f / sqrtf((float)head_dimension),
             &probabilities, &attended);
     }
     if (result == 0) {
-        merge_attention_output(&attended, &merged, batch,
-                               block->sequence_length, block->d_model,
-                               block->heads);
-        result = ops_gemm(&merged, &block->attention_output.value,
+        result = ops_merge_heads(&attended, &merged, batch,
+                                 block->sequence_length, block->d_model,
+                                 block->heads) ||
+            ops_gemm(&merged, &block->attention_output.value,
                           &mlp_residual) ||
             ops_residual(input, &mlp_residual, &attention_residual) ||
             ops_layer_norm(&attention_residual, &block->mlp_gamma.value,
@@ -505,21 +498,21 @@ int vit_encoder_block_forward_cached(const ViTEncoderBlock *block,
         ops_bias_add(&cache->projected, &block->query_key_value_bias.value,
                      &cache->projected);
     if (result == 0) {
-        split_attention_inputs(&cache->projected, &cache->query, &cache->key,
-                               &cache->value, cache->batch,
-                               block->sequence_length, block->d_model,
-                               block->heads);
-        result = ops_multi_head_attention(
+        result = ops_split_heads(&cache->projected, &cache->query,
+                                 &cache->key, &cache->value, cache->batch,
+                                 block->sequence_length, block->d_model,
+                                 block->heads) ||
+            ops_multi_head_attention(
             &cache->query, &cache->key, &cache->value, cache->batch,
             block->heads, block->sequence_length,
             1.0f / sqrtf((float)head_dimension), &cache->probabilities,
             &cache->attended);
     }
     if (result == 0) {
-        merge_attention_output(&cache->attended, &cache->merged, cache->batch,
-                               block->sequence_length, block->d_model,
-                               block->heads);
-        result = ops_gemm(&cache->merged, &block->attention_output.value,
+        result = ops_merge_heads(&cache->attended, &cache->merged,
+                                 cache->batch, block->sequence_length,
+                                 block->d_model, block->heads) ||
+            ops_gemm(&cache->merged, &block->attention_output.value,
                           &cache->attention_branch) ||
             ops_bias_add(&cache->attention_branch,
                          &block->attention_output_bias.value,
@@ -542,51 +535,6 @@ int vit_encoder_block_forward_cached(const ViTEncoderBlock *block,
                          &cache->output);
     }
     return result;
-}
-
-static void merge_attention_gradient(const Tensor *attended, Tensor *merged,
-                                     size_t batch, size_t sequence_length,
-                                     size_t d_model, size_t heads) {
-    const size_t head_dimension = d_model / heads;
-    for (size_t sample = 0; sample < batch; ++sample) {
-        for (size_t position = 0; position < sequence_length; ++position) {
-            const size_t merged_row = sample * sequence_length + position;
-            for (size_t head = 0; head < heads; ++head) {
-                const size_t attended_row =
-                    (sample * heads + head) * sequence_length + position;
-                for (size_t dimension = 0; dimension < head_dimension; ++dimension) {
-                    merged->grad[merged_row * d_model + head * head_dimension +
-                                 dimension] += attended->grad[
-                                     attended_row * head_dimension + dimension];
-                }
-            }
-        }
-    }
-}
-
-static void split_attention_gradient(const Tensor *projected, Tensor *query,
-                                     Tensor *key, Tensor *value, size_t batch,
-                                     size_t sequence_length, size_t d_model,
-                                     size_t heads) {
-    const size_t head_dimension = d_model / heads;
-    for (size_t sample = 0; sample < batch; ++sample) {
-        for (size_t position = 0; position < sequence_length; ++position) {
-            const size_t source_row = sample * sequence_length + position;
-            for (size_t head = 0; head < heads; ++head) {
-                const size_t target_row =
-                    (sample * heads + head) * sequence_length + position;
-                for (size_t dimension = 0; dimension < head_dimension; ++dimension) {
-                    const size_t offset = head * head_dimension + dimension;
-                    projected->grad[source_row * 3 * d_model + offset] +=
-                        query->grad[target_row * head_dimension + dimension];
-                    projected->grad[source_row * 3 * d_model + d_model + offset] +=
-                        key->grad[target_row * head_dimension + dimension];
-                    projected->grad[source_row * 3 * d_model + 2 * d_model + offset] +=
-                        value->grad[target_row * head_dimension + dimension];
-                }
-            }
-        }
-    }
 }
 
 int vit_encoder_block_backward(ViTEncoderBlock *block, const Tensor *input,
@@ -616,31 +564,29 @@ int vit_encoder_block_backward(ViTEncoderBlock *block, const Tensor *input,
     if (result != 0) {
         return result;
     }
-    for (size_t i = 0; i < tensor_numel(input); ++i) {
-        input_grad->grad[i] += cache->attention_residual.grad[i];
-        cache->attention_branch.grad[i] += cache->attention_residual.grad[i];
-    }
-    result = ops_bias_add_backward(&cache->attention_branch,
+    result = ops_accumulate_gradient(input_grad, &cache->attention_residual) ||
+        ops_accumulate_gradient(&cache->attention_branch,
+                                &cache->attention_residual) ||
+        ops_bias_add_backward(&cache->attention_branch,
                                    &block->attention_output_bias.value) ||
         ops_gemm_backward(&cache->merged, &block->attention_output.value,
                           &cache->attention_branch);
     if (result != 0) {
         return result;
     }
-    merge_attention_gradient(&cache->attended, &cache->merged, cache->batch,
-                             block->sequence_length, block->d_model,
-                             block->heads);
-    result = ops_multi_head_attention_backward(
-        &cache->query, &cache->key, &cache->value, cache->batch, block->heads,
-        block->sequence_length,
-        1.0f / sqrtf((float)(block->d_model / block->heads)),
-        &cache->probabilities, &cache->attended, &cache->query, &cache->key,
-        &cache->value);
-    split_attention_gradient(&cache->projected, &cache->query, &cache->key,
-                             &cache->value, cache->batch,
-                             block->sequence_length, block->d_model,
-                             block->heads);
-    result = result ||
+    result = ops_merge_heads_backward(&cache->attended, &cache->merged,
+                                      cache->batch, block->sequence_length,
+                                      block->d_model, block->heads) ||
+        ops_multi_head_attention_backward(
+            &cache->query, &cache->key, &cache->value, cache->batch,
+            block->heads, block->sequence_length,
+            1.0f / sqrtf((float)(block->d_model / block->heads)),
+            &cache->probabilities, &cache->attended, &cache->query,
+            &cache->key, &cache->value) ||
+        ops_split_heads_backward(&cache->projected, &cache->query, &cache->key,
+                                 &cache->value, cache->batch,
+                                 block->sequence_length, block->d_model,
+                                 block->heads) ||
         ops_bias_add_backward(&cache->projected,
                               &block->query_key_value_bias.value) ||
         ops_gemm_backward(&cache->normalized_attention,
@@ -680,6 +626,7 @@ void vit_classification_head_free(ViTClassificationHead *head) {
 int vit_classification_head_forward(const ViTClassificationHead *head,
                                     const Tensor *tokens, size_t batch,
                                     size_t sequence_length, Tensor *logits) {
+    ops_synchronize();
     if (!head || !tokens || !logits || batch == 0 || sequence_length == 0 ||
         tokens->ndim != 2 || logits->ndim != 2 ||
         tokens->rows != batch * sequence_length ||
@@ -707,6 +654,7 @@ int vit_classification_head_backward(ViTClassificationHead *head,
                                      const Tensor *tokens, size_t batch,
                                      size_t sequence_length,
                                      const Tensor *logits, Tensor *token_grad) {
+    ops_synchronize();
     if (!head || !tokens || !logits || !token_grad || batch == 0 ||
         sequence_length == 0 || tokens->ndim != 2 || logits->ndim != 2 ||
         token_grad->ndim != 2 || tokens->rows != batch * sequence_length ||
@@ -736,7 +684,8 @@ int vit_classification_head_backward(ViTClassificationHead *head,
     return 0;
 }
 
-int vit_model_init(ViTModel *model, const ViTConfig *config) {
+int vit_model_init_seeded(ViTModel *model, const ViTConfig *config,
+                          uint64_t seed) {
     if (!model || !config || config->channels == 0 || config->height == 0 ||
         config->width == 0 || config->patch_size == 0 ||
         config->d_model == 0 || config->heads == 0 || config->layers == 0 ||
@@ -778,20 +727,28 @@ int vit_model_init(ViTModel *model, const ViTConfig *config) {
     for (size_t dimension = 0; dimension < config->d_model; ++dimension) {
         model->final_gamma.value.data[dimension] = 1.0f;
     }
-    initialize_parameter_values(&model->patch_projection.projection, 0.1f, 1);
-    initialize_parameter_values(&model->token_embedding.cls_token, 0.02f, 2);
-    initialize_parameter_values(&model->token_embedding.positional_embeddings,
-                                0.02f, 3);
+    const float embedding_standard_deviation = 0.02f;
+    uint64_t random_state = seed;
+    initialize_xavier_uniform(&model->patch_projection.projection,
+                              &random_state);
+    initialize_truncated_normal(&model->token_embedding.cls_token,
+                                embedding_standard_deviation, &random_state);
+    initialize_truncated_normal(&model->token_embedding.positional_embeddings,
+                                embedding_standard_deviation, &random_state);
     for (size_t layer = 0; layer < config->layers; ++layer) {
         ViTEncoderBlock *block = &model->blocks[layer];
-        initialize_parameter_values(&block->query_key_value, 0.05f, layer + 4);
-        initialize_parameter_values(&block->attention_output, 0.05f, layer + 5);
-        initialize_parameter_values(&block->mlp_input, 0.05f, layer + 6);
-        initialize_parameter_values(&block->mlp_output, 0.05f, layer + 7);
+        initialize_xavier_uniform(&block->query_key_value, &random_state);
+        initialize_xavier_uniform(&block->attention_output, &random_state);
+        initialize_xavier_uniform(&block->mlp_input, &random_state);
+        initialize_xavier_uniform(&block->mlp_output, &random_state);
     }
-    initialize_parameter_values(&model->classification_head.projection, 0.05f,
-                                100);
+    initialize_truncated_normal(&model->classification_head.projection,
+                                embedding_standard_deviation, &random_state);
     return 0;
+}
+
+int vit_model_init(ViTModel *model, const ViTConfig *config) {
+    return vit_model_init_seeded(model, config, 42);
 }
 
 void vit_model_free(ViTModel *model) {
@@ -812,33 +769,69 @@ void vit_model_free(ViTModel *model) {
     memset(model, 0, sizeof(*model));
 }
 
+typedef struct {
+    Parameter *parameter;
+    int uses_weight_decay;
+} TrainableParameter;
+
+static size_t trainable_parameter_count(const ViTModel *model) {
+    const size_t embedding_and_head_parameters = 8;
+    const size_t parameters_per_block = 12;
+    return embedding_and_head_parameters +
+           parameters_per_block * model->config.layers;
+}
+
+static TrainableParameter *collect_trainable_parameters(ViTModel *model) {
+    TrainableParameter *parameters =
+        malloc(trainable_parameter_count(model) * sizeof(*parameters));
+    if (!parameters) {
+        return NULL;
+    }
+    size_t count = 0;
+#define ADD_PARAMETER(target, decays) \
+    parameters[count++] = (TrainableParameter){&(target), (decays)}
+    ADD_PARAMETER(model->patch_projection.projection, 1);
+    ADD_PARAMETER(model->patch_projection.bias, 0);
+    ADD_PARAMETER(model->token_embedding.cls_token, 0);
+    ADD_PARAMETER(model->token_embedding.positional_embeddings, 0);
+    for (size_t layer = 0; layer < model->config.layers; ++layer) {
+        ViTEncoderBlock *block = &model->blocks[layer];
+        ADD_PARAMETER(block->query_key_value, 1);
+        ADD_PARAMETER(block->query_key_value_bias, 0);
+        ADD_PARAMETER(block->attention_output, 1);
+        ADD_PARAMETER(block->attention_output_bias, 0);
+        ADD_PARAMETER(block->mlp_input, 1);
+        ADD_PARAMETER(block->mlp_input_bias, 0);
+        ADD_PARAMETER(block->mlp_output, 1);
+        ADD_PARAMETER(block->mlp_output_bias, 0);
+        ADD_PARAMETER(block->attention_gamma, 0);
+        ADD_PARAMETER(block->attention_beta, 0);
+        ADD_PARAMETER(block->mlp_gamma, 0);
+        ADD_PARAMETER(block->mlp_beta, 0);
+    }
+    ADD_PARAMETER(model->final_gamma, 0);
+    ADD_PARAMETER(model->final_beta, 0);
+    ADD_PARAMETER(model->classification_head.projection, 1);
+    ADD_PARAMETER(model->classification_head.bias, 0);
+#undef ADD_PARAMETER
+    return parameters;
+}
+
 void vit_model_zero_grad(ViTModel *model) {
     if (!model) {
         return;
     }
-    parameter_zero_grad(&model->patch_projection.projection);
-    parameter_zero_grad(&model->patch_projection.bias);
-    parameter_zero_grad(&model->token_embedding.cls_token);
-    parameter_zero_grad(&model->token_embedding.positional_embeddings);
-    parameter_zero_grad(&model->final_gamma);
-    parameter_zero_grad(&model->final_beta);
-    parameter_zero_grad(&model->classification_head.projection);
-    parameter_zero_grad(&model->classification_head.bias);
-    for (size_t layer = 0; layer < model->config.layers; ++layer) {
-        ViTEncoderBlock *block = &model->blocks[layer];
-        parameter_zero_grad(&block->query_key_value);
-        parameter_zero_grad(&block->query_key_value_bias);
-        parameter_zero_grad(&block->attention_output);
-        parameter_zero_grad(&block->attention_output_bias);
-        parameter_zero_grad(&block->mlp_input);
-        parameter_zero_grad(&block->mlp_input_bias);
-        parameter_zero_grad(&block->mlp_output);
-        parameter_zero_grad(&block->mlp_output_bias);
-        parameter_zero_grad(&block->attention_gamma);
-        parameter_zero_grad(&block->attention_beta);
-        parameter_zero_grad(&block->mlp_gamma);
-        parameter_zero_grad(&block->mlp_beta);
+    const size_t count = trainable_parameter_count(model);
+    TrainableParameter *parameters = collect_trainable_parameters(model);
+    Tensor **values = malloc(count * sizeof(*values));
+    if (parameters && values) {
+        for (size_t i = 0; i < count; ++i) {
+            values[i] = &parameters[i].parameter->value;
+        }
+        ops_zero_gradients(values, count);
     }
+    free(values);
+    free(parameters);
 }
 
 int vit_model_cache_init(ViTModelCache *cache, const ViTModel *model,
@@ -849,23 +842,33 @@ int vit_model_cache_init(ViTModelCache *cache, const ViTModel *model,
     memset(cache, 0, sizeof(*cache));
     cache->batch = batch;
     cache->layers = model->config.layers;
+    const ViTConfig *config = &model->config;
     const size_t token_rows = batch * model->sequence_length;
-    if (tensor_init(&cache->patch_tokens, batch * model->patch_count,
-                    model->config.d_model) != 0 ||
-        tensor_init(&cache->tokens, token_rows, model->config.d_model) != 0 ||
+    const size_t image_size = config->channels * config->height * config->width;
+    const size_t patch_elements =
+        config->channels * config->patch_size * config->patch_size;
+    if (tensor_init(&cache->images, batch, image_size) != 0 ||
+        tensor_init(&cache->patches, batch * model->patch_count,
+                    patch_elements) != 0 ||
+        tensor_init(&cache->patch_tokens, batch * model->patch_count,
+                    config->d_model) != 0 ||
+        tensor_init(&cache->tokens, token_rows, config->d_model) != 0 ||
         tensor_init(&cache->normalized_tokens, token_rows,
-                    model->config.d_model) != 0 ||
-        tensor_init(&cache->logits, batch, model->config.classes) != 0) {
+                    config->d_model) != 0 ||
+        tensor_init(&cache->cls_tokens, batch, config->d_model) != 0 ||
+        tensor_init(&cache->logits, batch, config->classes) != 0 ||
+        tensor_init(&cache->targets, batch, 1) != 0 ||
+        tensor_init(&cache->class_weights, 1, config->classes) != 0 ||
+        tensor_init(&cache->loss, 1, 1) != 0) {
         vit_model_cache_free(cache);
         return -1;
     }
-    cache->block_caches = calloc(model->config.layers,
-                                 sizeof(*cache->block_caches));
+    cache->block_caches = calloc(config->layers, sizeof(*cache->block_caches));
     if (!cache->block_caches) {
         vit_model_cache_free(cache);
         return -1;
     }
-    for (size_t layer = 0; layer < model->config.layers; ++layer) {
+    for (size_t layer = 0; layer < config->layers; ++layer) {
         if (vit_encoder_block_cache_init(&cache->block_caches[layer],
                                          &model->blocks[layer], batch) != 0) {
             vit_model_cache_free(cache);
@@ -879,96 +882,78 @@ void vit_model_cache_free(ViTModelCache *cache) {
     if (!cache) {
         return;
     }
+    ops_synchronize();
     if (cache->block_caches) {
         for (size_t layer = 0; layer < cache->layers; ++layer) {
             vit_encoder_block_cache_free(&cache->block_caches[layer]);
         }
         free(cache->block_caches);
     }
+    tensor_free(&cache->images);
+    tensor_free(&cache->patches);
     tensor_free(&cache->patch_tokens);
     tensor_free(&cache->tokens);
     tensor_free(&cache->normalized_tokens);
+    tensor_free(&cache->cls_tokens);
     tensor_free(&cache->logits);
+    tensor_free(&cache->targets);
+    tensor_free(&cache->class_weights);
+    tensor_free(&cache->loss);
     memset(cache, 0, sizeof(*cache));
-}
-
-static void accumulate_parameter_norm(const Parameter *parameter,
-                                      double *squared_norm) {
-    const size_t count = tensor_numel(&parameter->value);
-    for (size_t index = 0; index < count; ++index) {
-        const double gradient = parameter->value.grad[index];
-        *squared_norm += gradient * gradient;
-    }
-}
-
-static void scale_parameter_gradient(Parameter *parameter, float scale) {
-    const size_t count = tensor_numel(&parameter->value);
-    for (size_t index = 0; index < count; ++index) {
-        parameter->value.grad[index] *= scale;
-    }
 }
 
 int vit_model_clip_gradients(ViTModel *model, float max_norm) {
     if (!model || max_norm <= 0.0f) {
         return -1;
     }
-    double squared_norm = 0.0;
-#define ACCUMULATE(parameter) accumulate_parameter_norm(&(parameter), &squared_norm)
-    ACCUMULATE(model->patch_projection.projection);
-    ACCUMULATE(model->patch_projection.bias);
-    ACCUMULATE(model->token_embedding.cls_token);
-    ACCUMULATE(model->token_embedding.positional_embeddings);
-    for (size_t layer = 0; layer < model->config.layers; ++layer) {
-        ViTEncoderBlock *block = &model->blocks[layer];
-        ACCUMULATE(block->query_key_value);
-        ACCUMULATE(block->query_key_value_bias);
-        ACCUMULATE(block->attention_output);
-        ACCUMULATE(block->attention_output_bias);
-        ACCUMULATE(block->mlp_input);
-        ACCUMULATE(block->mlp_input_bias);
-        ACCUMULATE(block->mlp_output);
-        ACCUMULATE(block->mlp_output_bias);
-        ACCUMULATE(block->attention_gamma);
-        ACCUMULATE(block->attention_beta);
-        ACCUMULATE(block->mlp_gamma);
-        ACCUMULATE(block->mlp_beta);
+    const size_t count = trainable_parameter_count(model);
+    TrainableParameter *trainable = collect_trainable_parameters(model);
+    Parameter **parameters = malloc(count * sizeof(*parameters));
+    int result = -1;
+    if (trainable && parameters) {
+        for (size_t i = 0; i < count; ++i) {
+            parameters[i] = trainable[i].parameter;
+        }
+        result = ops_clip_gradient_norm(parameters, count, max_norm);
     }
-    ACCUMULATE(model->final_gamma);
-    ACCUMULATE(model->final_beta);
-    ACCUMULATE(model->classification_head.projection);
-    ACCUMULATE(model->classification_head.bias);
-#undef ACCUMULATE
-    const double norm = sqrt(squared_norm);
-    if (norm <= (double)max_norm || norm == 0.0) {
-        return 0;
+    free(parameters);
+    free(trainable);
+    return result;
+}
+
+static int vit_model_encode_forward(const ViTModel *model, const float *images,
+                                    ViTModelCache *cache) {
+    const ViTConfig *config = &model->config;
+    int result = ops_upload_values(&cache->images, images) ||
+        ops_extract_patches(&cache->images, &cache->patches, config->channels,
+                            config->height, config->width,
+                            config->patch_size) ||
+        ops_gemm(&cache->patches, &model->patch_projection.projection.value,
+                 &cache->patch_tokens) ||
+        ops_bias_add(&cache->patch_tokens, &model->patch_projection.bias.value,
+                     &cache->patch_tokens) ||
+        ops_token_embedding(&cache->patch_tokens,
+                            &model->token_embedding.cls_token.value,
+                            &model->token_embedding.positional_embeddings.value,
+                            &cache->tokens, cache->batch);
+    const Tensor *block_input = &cache->tokens;
+    for (size_t layer = 0; result == 0 && layer < config->layers; ++layer) {
+        result = vit_encoder_block_forward_cached(&model->blocks[layer],
+                                                  block_input,
+                                                  &cache->block_caches[layer]);
+        block_input = &cache->block_caches[layer].output;
     }
-    const float scale = (float)((double)max_norm / norm);
-#define SCALE(parameter) scale_parameter_gradient(&(parameter), scale)
-    SCALE(model->patch_projection.projection);
-    SCALE(model->patch_projection.bias);
-    SCALE(model->token_embedding.cls_token);
-    SCALE(model->token_embedding.positional_embeddings);
-    for (size_t layer = 0; layer < model->config.layers; ++layer) {
-        ViTEncoderBlock *block = &model->blocks[layer];
-        SCALE(block->query_key_value);
-        SCALE(block->query_key_value_bias);
-        SCALE(block->attention_output);
-        SCALE(block->attention_output_bias);
-        SCALE(block->mlp_input);
-        SCALE(block->mlp_input_bias);
-        SCALE(block->mlp_output);
-        SCALE(block->mlp_output_bias);
-        SCALE(block->attention_gamma);
-        SCALE(block->attention_beta);
-        SCALE(block->mlp_gamma);
-        SCALE(block->mlp_beta);
-    }
-    SCALE(model->final_gamma);
-    SCALE(model->final_beta);
-    SCALE(model->classification_head.projection);
-    SCALE(model->classification_head.bias);
-#undef SCALE
-    return 0;
+    return result ||
+        ops_layer_norm(block_input, &model->final_gamma.value,
+                       &model->final_beta.value, 1e-5f,
+                       &cache->normalized_tokens) ||
+        ops_gather_rows(&cache->normalized_tokens, &cache->cls_tokens,
+                        model->sequence_length) ||
+        ops_gemm(&cache->cls_tokens,
+                 &model->classification_head.projection.value,
+                 &cache->logits) ||
+        ops_bias_add(&cache->logits, &model->classification_head.bias.value,
+                     &cache->logits);
 }
 
 int vit_model_forward(const ViTModel *model, const float *images, size_t batch,
@@ -976,102 +961,92 @@ int vit_model_forward(const ViTModel *model, const float *images, size_t batch,
     if (!model || !images || !cache || batch == 0 || cache->batch != batch) {
         return -1;
     }
-    int result = vit_patch_projection_forward(&model->patch_projection, images,
-                                              batch, &cache->patch_tokens) ||
-        vit_token_embedding_forward(&model->token_embedding,
-                                    &cache->patch_tokens, batch,
-                                    &cache->tokens);
-    const Tensor *block_input = &cache->tokens;
-    for (size_t layer = 0; result == 0 && layer < model->config.layers; ++layer) {
-        result = vit_encoder_block_forward_cached(&model->blocks[layer],
-                                                  block_input,
-                                                  &cache->block_caches[layer]);
-        block_input = &cache->block_caches[layer].output;
-    }
-    if (result == 0) {
-        result = ops_layer_norm(block_input, &model->final_gamma.value,
-                                &model->final_beta.value, 1e-5f,
-                                &cache->normalized_tokens) ||
-            vit_classification_head_forward(&model->classification_head,
-                                            &cache->normalized_tokens, batch,
-                                            model->sequence_length,
-                                            &cache->logits);
-    }
+    const int result = vit_model_encode_forward(model, images, cache);
+    ops_synchronize();
     return result;
 }
 
 int vit_model_backward(ViTModel *model, const float *images,
                        ViTModelCache *cache, float *image_grad) {
-    if (!model || !images || !cache || !image_grad || cache->batch == 0) {
+    if (!model || !images || !cache || cache->batch == 0) {
         return -1;
     }
-    int result = vit_classification_head_backward(
-        &model->classification_head, &cache->normalized_tokens, cache->batch,
-        model->sequence_length, &cache->logits, &cache->normalized_tokens);
-    Tensor *last_input_grad = model->config.layers == 0
-        ? &cache->tokens
-        : &cache->block_caches[model->config.layers - 1].output;
-    const Tensor *last_input = last_input_grad;
-    result = result ||
-        ops_layer_norm_backward(last_input, &model->final_gamma.value, 1e-5f,
-                                &cache->normalized_tokens, last_input_grad,
-                                &model->final_gamma.value,
+    const ViTConfig *config = &model->config;
+    Tensor *last_block_output = &cache->block_caches[config->layers - 1].output;
+    int result = ops_bias_add_backward(&cache->logits,
+                                       &model->classification_head.bias.value) ||
+        ops_gemm_backward(&cache->cls_tokens,
+                          &model->classification_head.projection.value,
+                          &cache->logits) ||
+        ops_gather_rows_backward(&cache->normalized_tokens, &cache->cls_tokens,
+                                 model->sequence_length) ||
+        ops_layer_norm_backward(last_block_output, &model->final_gamma.value,
+                                1e-5f, &cache->normalized_tokens,
+                                last_block_output, &model->final_gamma.value,
                                 &model->final_beta.value);
-    for (size_t layer = model->config.layers; result == 0 && layer > 0; --layer) {
+    for (size_t layer = config->layers; result == 0 && layer > 0; --layer) {
         const size_t index = layer - 1;
-        Tensor *block_input_grad = index == 0
-            ? &cache->tokens
-            : &cache->block_caches[index - 1].output;
-        const Tensor *block_input = index == 0
+        Tensor *block_input = index == 0
             ? &cache->tokens
             : &cache->block_caches[index - 1].output;
         result = vit_encoder_block_backward(&model->blocks[index], block_input,
                                             &cache->block_caches[index],
-                                            block_input_grad);
+                                            block_input);
     }
-    if (result == 0) {
-        result = vit_token_embedding_backward(&model->token_embedding,
-                                              &cache->tokens, cache->batch,
-                                              &cache->patch_tokens);
-    }
-    if (result == 0) {
-        result = vit_patch_projection_backward(&model->patch_projection, images,
-                                               cache->batch,
-                                               &cache->patch_tokens,
-                                               image_grad);
+    result = result ||
+        ops_token_embedding_backward(
+            &cache->patch_tokens, &model->token_embedding.cls_token.value,
+            &model->token_embedding.positional_embeddings.value,
+            &cache->tokens, cache->batch) ||
+        ops_bias_add_backward(&cache->patch_tokens,
+                              &model->patch_projection.bias.value) ||
+        ops_gemm_backward(&cache->patches,
+                          &model->patch_projection.projection.value,
+                          &cache->patch_tokens);
+    if (result == 0 && image_grad) {
+        result = ops_extract_patches_backward(&cache->patches, image_grad,
+                                              config->channels, config->height,
+                                              config->width,
+                                              config->patch_size);
     }
     return result;
 }
 
-static void vit_model_zero_cache_grad(ViTModelCache *cache) {
-    tensor_zero_grad(&cache->patch_tokens);
-    tensor_zero_grad(&cache->tokens);
-    tensor_zero_grad(&cache->normalized_tokens);
-    tensor_zero_grad(&cache->logits);
+static int vit_model_zero_cache_grad(ViTModelCache *cache) {
+    Tensor *model_tensors[] = {
+        &cache->images, &cache->patches, &cache->patch_tokens, &cache->tokens,
+        &cache->normalized_tokens, &cache->cls_tokens, &cache->logits,
+        &cache->targets, &cache->class_weights, &cache->loss,
+    };
+    const size_t model_tensor_count =
+        sizeof(model_tensors) / sizeof(*model_tensors);
+    const size_t tensors_per_block = 15;
+    const size_t count = model_tensor_count + tensors_per_block * cache->layers;
+    Tensor **tensors = malloc(count * sizeof(*tensors));
+    if (!tensors) {
+        return -1;
+    }
+    size_t index = 0;
+    for (size_t i = 0; i < model_tensor_count; ++i) {
+        tensors[index++] = model_tensors[i];
+    }
     for (size_t layer = 0; layer < cache->layers; ++layer) {
         ViTEncoderBlockCache *block = &cache->block_caches[layer];
-        tensor_zero_grad(&block->normalized_attention);
-        tensor_zero_grad(&block->projected);
-        tensor_zero_grad(&block->query);
-        tensor_zero_grad(&block->key);
-        tensor_zero_grad(&block->value);
-        tensor_zero_grad(&block->probabilities);
-        tensor_zero_grad(&block->attended);
-        tensor_zero_grad(&block->merged);
-        tensor_zero_grad(&block->attention_branch);
-        tensor_zero_grad(&block->attention_residual);
-        tensor_zero_grad(&block->normalized_mlp);
-        tensor_zero_grad(&block->hidden);
-        tensor_zero_grad(&block->activated);
-        tensor_zero_grad(&block->mlp_branch);
-        tensor_zero_grad(&block->output);
+        Tensor *block_tensors[] = {
+            &block->normalized_attention, &block->projected, &block->query,
+            &block->key, &block->value, &block->probabilities,
+            &block->attended, &block->merged, &block->attention_branch,
+            &block->attention_residual, &block->normalized_mlp,
+            &block->hidden, &block->activated, &block->mlp_branch,
+            &block->output,
+        };
+        for (size_t i = 0; i < tensors_per_block; ++i) {
+            tensors[index++] = block_tensors[i];
+        }
     }
-}
-
-static int vit_model_step_parameter(Parameter *parameter, float learning_rate,
-                                    float weight_decay) {
-    return ops_adamw_step(parameter, learning_rate, 0.9f, 0.999f, 1e-8f,
-                          weight_decay);
+    const int result = ops_zero_gradients(tensors, count);
+    free(tensors);
+    return result;
 }
 
 int vit_model_train_batch(ViTModel *model, const float *images,
@@ -1087,68 +1062,60 @@ int vit_model_train_batch_weighted(
     ViTModel *model, const float *images, const size_t *targets, size_t batch,
     ViTModelCache *cache, float learning_rate, float weight_decay,
     const float *class_weights, float *loss) {
+    return vit_model_train_batch_smoothed(
+        model, images, targets, batch, cache, learning_rate, weight_decay,
+        class_weights, 0.0f, loss);
+}
+
+static int vit_model_apply_clipped_adamw(ViTModel *model, float learning_rate,
+                                         float weight_decay,
+                                         float max_gradient_norm) {
+    const size_t count = trainable_parameter_count(model);
+    TrainableParameter *trainable = collect_trainable_parameters(model);
+    Parameter **parameters = malloc(count * sizeof(*parameters));
+    float *weight_decays = malloc(count * sizeof(*weight_decays));
+    int result = -1;
+    if (trainable && parameters && weight_decays) {
+        for (size_t i = 0; i < count; ++i) {
+            parameters[i] = trainable[i].parameter;
+            weight_decays[i] = trainable[i].uses_weight_decay ? weight_decay
+                                                              : 0.0f;
+        }
+        result = ops_adamw_step_parameters(parameters, weight_decays, count,
+                                           learning_rate, 0.9f, 0.999f, 1e-8f,
+                                           max_gradient_norm);
+    }
+    free(weight_decays);
+    free(parameters);
+    free(trainable);
+    return result;
+}
+
+int vit_model_train_batch_smoothed(
+    ViTModel *model, const float *images, const size_t *targets, size_t batch,
+    ViTModelCache *cache, float learning_rate, float weight_decay,
+    const float *class_weights, float label_smoothing, float *loss) {
     if (!model || !images || !targets || !cache || !loss || batch == 0 ||
         cache->batch != batch || learning_rate <= 0.0f || weight_decay < 0.0f) {
         return -1;
     }
+    const float max_gradient_norm = 1.0f;
     vit_model_zero_grad(model);
-    vit_model_zero_cache_grad(cache);
-    if (vit_model_forward(model, images, batch, cache) != 0 ||
-        ops_softmax_cross_entropy_weighted(
-            &cache->logits, targets, class_weights, loss, &cache->logits) != 0) {
-        return -1;
-    }
-    const size_t image_count = batch * model->config.channels *
-                               model->config.height * model->config.width;
-    float *image_grad = calloc(image_count, sizeof(*image_grad));
-    if (!image_grad) {
-        return -1;
-    }
-    int result = vit_model_backward(model, images, cache, image_grad);
-    free(image_grad);
-    if (result != 0) {
-        return result;
-    }
-    if (vit_model_clip_gradients(model, 1.0f) != 0) {
-        return -1;
-    }
-
-    result = vit_model_step_parameter(&model->patch_projection.projection,
-                                      learning_rate, weight_decay) ||
-        vit_model_step_parameter(&model->patch_projection.bias, learning_rate, 0.0f) ||
-        vit_model_step_parameter(&model->token_embedding.cls_token,
-                                 learning_rate, 0.0f) ||
-        vit_model_step_parameter(&model->token_embedding.positional_embeddings,
-                                 learning_rate, 0.0f);
-    for (size_t layer = 0; result == 0 && layer < model->config.layers; ++layer) {
-        ViTEncoderBlock *block = &model->blocks[layer];
-        result = vit_model_step_parameter(&block->query_key_value,
-                                          learning_rate, weight_decay) ||
-            vit_model_step_parameter(&block->query_key_value_bias,
-                                     learning_rate, 0.0f) ||
-            vit_model_step_parameter(&block->attention_output,
-                                     learning_rate, weight_decay) ||
-            vit_model_step_parameter(&block->attention_output_bias,
-                                     learning_rate, 0.0f) ||
-            vit_model_step_parameter(&block->mlp_input, learning_rate,
-                                     weight_decay) ||
-            vit_model_step_parameter(&block->mlp_input_bias, learning_rate, 0.0f) ||
-            vit_model_step_parameter(&block->mlp_output, learning_rate,
-                                     weight_decay) ||
-            vit_model_step_parameter(&block->mlp_output_bias,
-                                     learning_rate, 0.0f) ||
-            vit_model_step_parameter(&block->attention_gamma, learning_rate, 0.0f) ||
-            vit_model_step_parameter(&block->attention_beta, learning_rate, 0.0f) ||
-            vit_model_step_parameter(&block->mlp_gamma, learning_rate, 0.0f) ||
-            vit_model_step_parameter(&block->mlp_beta, learning_rate, 0.0f);
-    }
+    int result = vit_model_zero_cache_grad(cache) ||
+        ops_upload_labels(&cache->targets, targets) ||
+        (class_weights &&
+         ops_upload_values(&cache->class_weights, class_weights)) ||
+        vit_model_encode_forward(model, images, cache) ||
+        ops_softmax_cross_entropy_tensor(
+            &cache->logits, &cache->targets,
+            class_weights ? &cache->class_weights : NULL, label_smoothing,
+            &cache->loss, &cache->logits) ||
+        vit_model_backward(model, images, cache, NULL) ||
+        vit_model_apply_clipped_adamw(model, learning_rate, weight_decay,
+                                      max_gradient_norm);
+    ops_synchronize();
     if (result == 0) {
-        result = vit_model_step_parameter(&model->final_gamma, learning_rate, 0.0f) ||
-            vit_model_step_parameter(&model->final_beta, learning_rate, 0.0f) ||
-            vit_model_step_parameter(&model->classification_head.projection,
-                                     learning_rate, weight_decay) ||
-            vit_model_step_parameter(&model->classification_head.bias,
-                                     learning_rate, 0.0f);
+        *loss = cache->loss.data[0];
     }
     return result;
 }
@@ -1236,6 +1203,7 @@ static int read_model_parameters(FILE *file, ViTModel *model) {
 }
 
 int vit_model_save(const ViTModel *model, const char *path) {
+    ops_synchronize();
     static const char magic[8] = {'C', 'V', 'I', 'T', 'C', 'K', 'P', '\0'};
     const uint32_t version = 1;
     if (!model || !path) {
@@ -1255,9 +1223,35 @@ int vit_model_save(const ViTModel *model, const char *path) {
     return result ? 0 : -1;
 }
 
-int vit_model_load(ViTModel *model, const char *path) {
+static int read_checkpoint_header(FILE *file, ViTConfig *config) {
     static const char magic[8] = {'C', 'V', 'I', 'T', 'C', 'K', 'P', '\0'};
+    const uint32_t supported_version = 1;
+    char file_magic[sizeof(magic)];
     uint32_t version = 0;
+    return fread(file_magic, sizeof(file_magic), 1, file) == 1 &&
+           memcmp(file_magic, magic, sizeof(magic)) == 0 &&
+           fread(&version, sizeof(version), 1, file) == 1 &&
+           version == supported_version &&
+           fread(config, sizeof(*config), 1, file) == 1
+        ? 0
+        : -1;
+}
+
+int vit_model_read_config(const char *path, ViTConfig *config) {
+    if (!path || !config) {
+        return -1;
+    }
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        return -1;
+    }
+    const int result = read_checkpoint_header(file, config);
+    fclose(file);
+    return result;
+}
+
+int vit_model_load(ViTModel *model, const char *path) {
+    ops_synchronize();
     ViTConfig config = {0};
     if (!model || !path) {
         return -1;
@@ -1266,16 +1260,98 @@ int vit_model_load(ViTModel *model, const char *path) {
     if (!file) {
         return -1;
     }
-    char file_magic[sizeof(magic)];
-    int result = fread(file_magic, sizeof(file_magic), 1, file) == 1 &&
-        memcmp(file_magic, magic, sizeof(magic)) == 0 &&
-        fread(&version, sizeof(version), 1, file) == 1 &&
-        version == 1 &&
-        fread(&config, sizeof(config), 1, file) == 1 &&
+    const int result = read_checkpoint_header(file, &config) == 0 &&
         memcmp(&config, &model->config, sizeof(config)) == 0 &&
         read_model_parameters(file, model) == 0;
     fclose(file);
     return result ? 0 : -1;
+}
+
+static double monotonic_seconds(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (double)now.tv_sec + (double)now.tv_nsec * 1e-9;
+}
+
+static size_t count_correct_predictions(const Tensor *logits,
+                                        const size_t *targets) {
+    size_t correct = 0;
+    for (size_t sample = 0; sample < logits->rows; ++sample) {
+        const float *sample_logits = logits->data + sample * logits->cols;
+        size_t prediction = 0;
+        for (size_t class_index = 1; class_index < logits->cols; ++class_index) {
+            if (sample_logits[class_index] > sample_logits[prediction]) {
+                prediction = class_index;
+            }
+        }
+        correct += prediction == targets[sample];
+    }
+    return correct;
+}
+
+static int evaluate_chunk(const ViTModel *model, const float *images,
+                          const size_t *targets, ViTModelCache *cache,
+                          double *loss_sum, size_t *correct) {
+    float chunk_loss = 0.0f;
+    if (vit_model_forward(model, images, cache->batch, cache) != 0 ||
+        ops_softmax_cross_entropy(&cache->logits, targets, &chunk_loss,
+                                  &cache->logits) != 0) {
+        return -1;
+    }
+    *loss_sum += (double)chunk_loss * (double)cache->batch;
+    *correct += count_correct_predictions(&cache->logits, targets);
+    return 0;
+}
+
+static void softmax_rows(const Tensor *logits, float *probabilities) {
+    for (size_t row = 0; row < logits->rows; ++row) {
+        const float *row_logits = logits->data + row * logits->cols;
+        float *row_probabilities = probabilities + row * logits->cols;
+        float maximum = row_logits[0];
+        for (size_t col = 1; col < logits->cols; ++col) {
+            maximum = fmaxf(maximum, row_logits[col]);
+        }
+        float denominator = 0.0f;
+        for (size_t col = 0; col < logits->cols; ++col) {
+            row_probabilities[col] = expf(row_logits[col] - maximum);
+            denominator += row_probabilities[col];
+        }
+        for (size_t col = 0; col < logits->cols; ++col) {
+            row_probabilities[col] /= denominator;
+        }
+    }
+}
+
+int vit_model_predict_probabilities(const ViTModel *model, const float *images,
+                                    size_t sample_count, float *probabilities) {
+    if (!model || !images || !probabilities || sample_count == 0) {
+        return -1;
+    }
+    const size_t maximum_chunk_size = 256;
+    const size_t image_size = model->config.channels * model->config.height *
+                              model->config.width;
+    ViTModelCache cache = {0};
+    int result = 0;
+    for (size_t offset = 0; result == 0 && offset < sample_count;
+         offset += maximum_chunk_size) {
+        const size_t remaining = sample_count - offset;
+        const size_t chunk_size = remaining < maximum_chunk_size
+            ? remaining
+            : maximum_chunk_size;
+        if (chunk_size != cache.batch) {
+            vit_model_cache_free(&cache);
+            result = vit_model_cache_init(&cache, model, chunk_size);
+        }
+        result = result ||
+            vit_model_forward(model, images + offset * image_size, chunk_size,
+                              &cache);
+        if (result == 0) {
+            softmax_rows(&cache.logits,
+                         probabilities + offset * model->config.classes);
+        }
+    }
+    vit_model_cache_free(&cache);
+    return result;
 }
 
 int vit_model_evaluate(const ViTModel *model, const float *images,
@@ -1284,40 +1360,44 @@ int vit_model_evaluate(const ViTModel *model, const float *images,
     if (!model || !images || !targets || !metrics || sample_count == 0) {
         return -1;
     }
-    ViTModelCache cache = {0};
-    if (vit_model_cache_init(&cache, model, sample_count) != 0) {
-        return -1;
-    }
-    const clock_t start = clock();
-    int result = vit_model_forward(model, images, sample_count, &cache);
-    float loss = 0.0f;
-    if (result == 0) {
-        result = ops_softmax_cross_entropy(&cache.logits, targets, &loss,
-                                           &cache.logits);
-    }
+    const size_t maximum_chunk_size = 256;
+    const size_t chunk_size = sample_count < maximum_chunk_size
+        ? sample_count
+        : maximum_chunk_size;
+    const size_t full_chunks = sample_count / chunk_size;
+    const size_t remainder = sample_count - full_chunks * chunk_size;
+    const size_t image_size = model->config.channels * model->config.height *
+                              model->config.width;
+    ViTModelCache chunk_cache = {0};
+    ViTModelCache remainder_cache = {0};
+    int result = vit_model_cache_init(&chunk_cache, model, chunk_size) ||
+        (remainder > 0 &&
+         vit_model_cache_init(&remainder_cache, model, remainder));
+    double loss_sum = 0.0;
     size_t correct = 0;
+    const double start = monotonic_seconds();
+    for (size_t chunk = 0; result == 0 && chunk < full_chunks; ++chunk) {
+        const size_t offset = chunk * chunk_size;
+        result = evaluate_chunk(model, images + offset * image_size,
+                                targets + offset, &chunk_cache, &loss_sum,
+                                &correct);
+    }
+    if (result == 0 && remainder > 0) {
+        const size_t offset = full_chunks * chunk_size;
+        result = evaluate_chunk(model, images + offset * image_size,
+                                targets + offset, &remainder_cache, &loss_sum,
+                                &correct);
+    }
     if (result == 0) {
-        for (size_t sample = 0; sample < sample_count; ++sample) {
-            size_t prediction = 0;
-            const float *logits = cache.logits.data +
-                                  sample * model->config.classes;
-            for (size_t class_index = 1;
-                 class_index < model->config.classes; ++class_index) {
-                if (logits[class_index] > logits[prediction]) {
-                    prediction = class_index;
-                }
-            }
-            correct += prediction == targets[sample];
-        }
-        const clock_t end = clock();
         metrics->accuracy = (float)correct / (float)sample_count;
-        metrics->average_loss = loss;
-        metrics->elapsed_seconds = (double)(end - start) / (double)CLOCKS_PER_SEC;
+        metrics->average_loss = (float)(loss_sum / (double)sample_count);
+        metrics->elapsed_seconds = monotonic_seconds() - start;
         metrics->samples_per_second =
             metrics->elapsed_seconds > 0.0
                 ? (double)sample_count / metrics->elapsed_seconds
                 : 0.0;
     }
-    vit_model_cache_free(&cache);
+    vit_model_cache_free(&remainder_cache);
+    vit_model_cache_free(&chunk_cache);
     return result;
 }

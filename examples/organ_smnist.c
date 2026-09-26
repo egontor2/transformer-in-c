@@ -1,7 +1,10 @@
+#include "augmentation.h"
 #include "dataset.h"
-#ifdef ENABLE_MPS
+#if defined(ENABLE_MPS)
 #include "mps_backend.h"
 #include "ops.h"
+#elif defined(ENABLE_CUDA)
+#include "cuda_backend.h"
 #endif
 #include "vit.h"
 
@@ -12,6 +15,57 @@
 #include <float.h>
 
 #define PI_F 3.14159265358979323846f
+
+#if defined(ENABLE_MPS)
+typedef MPSBackend Accelerator;
+#elif defined(ENABLE_CUDA)
+typedef CudaBackend Accelerator;
+#else
+typedef struct Accelerator Accelerator;
+#endif
+
+static void stop_accelerator(Accelerator *accelerator) {
+#if defined(ENABLE_MPS)
+    ops_reset_gemm_backend();
+    mps_backend_free(accelerator);
+#elif defined(ENABLE_CUDA)
+    cuda_backend_free(accelerator);
+#else
+    (void)accelerator;
+#endif
+}
+
+static int start_accelerator(Accelerator **accelerator) {
+    *accelerator = NULL;
+#if defined(ENABLE_MPS)
+    if (mps_backend_create(accelerator) != 0 ||
+        !mps_backend_available(*accelerator)) {
+        fprintf(stderr, "MPS backend unavailable\n");
+        mps_backend_free(*accelerator);
+        *accelerator = NULL;
+        return -1;
+    }
+    ops_set_gemm_backend(mps_backend_gemm_callback, *accelerator);
+    ops_set_gemm_backward_backend(mps_backend_gemm_backward_callback,
+                                  *accelerator);
+    if (mps_backend_enable_device_execution(*accelerator) != 0) {
+        fprintf(stderr, "Metal device execution unavailable\n");
+        stop_accelerator(*accelerator);
+        *accelerator = NULL;
+        return -1;
+    }
+#elif defined(ENABLE_CUDA)
+    if (cuda_backend_create(accelerator) != 0 ||
+        !cuda_backend_available(*accelerator) ||
+        cuda_backend_enable_device_execution(*accelerator) != 0) {
+        fprintf(stderr, "CUDA backend unavailable\n");
+        cuda_backend_free(*accelerator);
+        *accelerator = NULL;
+        return -1;
+    }
+#endif
+    return 0;
+}
 
 static unsigned long next_random(unsigned long *state) {
     *state = *state * 1664525UL + 1013904223UL;
@@ -46,49 +100,356 @@ static int shuffle_dataset(VisionDataset *dataset, unsigned long *state) {
     return 0;
 }
 
-static int print_class_metrics(const ViTModel *model,
-                               const VisionDataset *dataset) {
-    size_t correct[11] = {0};
-    size_t total[11] = {0};
-    ViTModelCache cache = {0};
-    if (vit_model_cache_init(&cache, model, 1) != 0) {
+typedef struct {
+    float mean;
+    float inverse_standard_deviation;
+} PixelStatistics;
+
+static PixelStatistics compute_pixel_statistics(const VisionDataset *dataset) {
+    const size_t pixel_count = dataset->sample_count * dataset->height *
+                               dataset->width * dataset->channels;
+    double sum = 0.0;
+    double squared_sum = 0.0;
+    for (size_t i = 0; i < pixel_count; ++i) {
+        sum += dataset->images[i];
+        squared_sum += (double)dataset->images[i] * dataset->images[i];
+    }
+    const double mean = sum / (double)pixel_count;
+    const double variance = squared_sum / (double)pixel_count - mean * mean;
+    const double minimum_variance = 1e-12;
+    PixelStatistics statistics = {
+        .mean = (float)mean,
+        .inverse_standard_deviation = (float)(1.0 / sqrt(
+            variance > minimum_variance ? variance : minimum_variance)),
+    };
+    return statistics;
+}
+
+static float normalize_pixel(float pixel, const PixelStatistics *statistics) {
+    return (pixel - statistics->mean) * statistics->inverse_standard_deviation;
+}
+
+static void normalize_dataset(VisionDataset *dataset,
+                              const PixelStatistics *statistics) {
+    const size_t pixel_count = dataset->sample_count * dataset->height *
+                               dataset->width * dataset->channels;
+    for (size_t i = 0; i < pixel_count; ++i) {
+        dataset->images[i] = normalize_pixel(dataset->images[i], statistics);
+    }
+}
+
+static DataAugmentation standard_pixel_augmentation(void) {
+    DataAugmentation augmentation = {
+        .max_shift_pixels = 2.0f,
+        .max_rotation_degrees = 10.0f,
+        .max_scale_delta = 0.1f,
+        .max_brightness_delta = 0.05f,
+        .max_contrast_delta = 0.1f,
+        .noise_standard_deviation = 0.01f,
+        .erasing_probability = 0.25f,
+        .erasing_max_side_fraction = 0.4f,
+    };
+    return augmentation;
+}
+
+static DataAugmentation normalize_augmentation(
+    const DataAugmentation *pixel_augmentation,
+    const PixelStatistics *statistics) {
+    DataAugmentation augmentation = *pixel_augmentation;
+    augmentation.max_brightness_delta *= statistics->inverse_standard_deviation;
+    augmentation.noise_standard_deviation *=
+        statistics->inverse_standard_deviation;
+    augmentation.erasing_value = normalize_pixel(statistics->mean, statistics);
+    augmentation.minimum_value = normalize_pixel(0.0f, statistics);
+    augmentation.maximum_value = normalize_pixel(1.0f, statistics);
+    return augmentation;
+}
+
+static void print_augmentation(const DataAugmentation *pixel_augmentation,
+                               float label_smoothing) {
+    printf("augmentation shift=%.2f rotation=%.2f scale=%.2f brightness=%.3f "
+           "contrast=%.2f noise=%.3f erasing=%.2f/%.2f label_smoothing=%.2f\n",
+           pixel_augmentation->max_shift_pixels,
+           pixel_augmentation->max_rotation_degrees,
+           pixel_augmentation->max_scale_delta,
+           pixel_augmentation->max_brightness_delta,
+           pixel_augmentation->max_contrast_delta,
+           pixel_augmentation->noise_standard_deviation,
+           pixel_augmentation->erasing_probability,
+           pixel_augmentation->erasing_max_side_fraction, label_smoothing);
+}
+
+static size_t predicted_class(const float *probabilities, size_t classes) {
+    size_t prediction = 0;
+    for (size_t class_index = 1; class_index < classes; ++class_index) {
+        if (probabilities[class_index] > probabilities[prediction]) {
+            prediction = class_index;
+        }
+    }
+    return prediction;
+}
+
+static int print_prediction_metrics(const char *split_name,
+                                    const float *probabilities,
+                                    const size_t *labels, size_t sample_count,
+                                    size_t classes, int print_details) {
+    size_t *total = calloc(classes, sizeof(*total));
+    size_t *predicted = calloc(classes, sizeof(*predicted));
+    size_t *confusion = calloc(classes * classes, sizeof(*confusion));
+    if (!total || !predicted || !confusion) {
+        free(total);
+        free(predicted);
+        free(confusion);
         return -1;
     }
-    const size_t image_size = dataset->height * dataset->width *
-                              dataset->channels;
-    for (size_t sample = 0; sample < dataset->sample_count; ++sample) {
-        if (vit_model_forward(model, dataset->images + sample * image_size, 1,
-                              &cache) != 0) {
-            vit_model_cache_free(&cache);
+    const double minimum_probability = 1e-12;
+    double negative_log_likelihood = 0.0;
+    size_t correct = 0;
+    for (size_t sample = 0; sample < sample_count; ++sample) {
+        const float *sample_probabilities = probabilities + sample * classes;
+        const size_t label = labels[sample];
+        const size_t prediction = predicted_class(sample_probabilities, classes);
+        if (label < classes) {
+            ++total[label];
+            ++predicted[prediction];
+            ++confusion[label * classes + prediction];
+            correct += prediction == label;
+            negative_log_likelihood -= log(fmax(
+                (double)sample_probabilities[label], minimum_probability));
+        }
+    }
+    double balanced_accuracy = 0.0;
+    double macro_f1 = 0.0;
+    for (size_t class_index = 0; class_index < classes; ++class_index) {
+        const size_t true_positive = confusion[class_index * classes +
+                                                class_index];
+        const double recall = total[class_index] == 0
+            ? 0.0
+            : (double)true_positive / (double)total[class_index];
+        const double precision = predicted[class_index] == 0
+            ? 0.0
+            : (double)true_positive / (double)predicted[class_index];
+        balanced_accuracy += recall;
+        macro_f1 += precision + recall == 0.0
+            ? 0.0
+            : 2.0 * precision * recall / (precision + recall);
+    }
+    balanced_accuracy /= (double)classes;
+    macro_f1 /= (double)classes;
+    printf("%s accuracy=%.4f loss=%.6f balanced_accuracy=%.4f macro_f1=%.4f\n",
+           split_name, (double)correct / (double)sample_count,
+           negative_log_likelihood / (double)sample_count, balanced_accuracy,
+           macro_f1);
+    if (print_details) {
+        printf("%s accuracy by class:\n", split_name);
+        for (size_t class_index = 0; class_index < classes; ++class_index) {
+            const size_t true_positive =
+                confusion[class_index * classes + class_index];
+            printf("  class %zu: %.4f (%zu/%zu)\n", class_index,
+                   total[class_index] == 0
+                       ? 0.0
+                       : (double)true_positive / (double)total[class_index],
+                   true_positive, total[class_index]);
+        }
+        printf("%s confusion matrix (rows=label, columns=prediction):\n",
+               split_name);
+        for (size_t row = 0; row < classes; ++row) {
+            printf("  %zu:", row);
+            for (size_t col = 0; col < classes; ++col) {
+                printf(" %zu", confusion[row * classes + col]);
+            }
+            putchar('\n');
+        }
+    }
+    free(total);
+    free(predicted);
+    free(confusion);
+    return 0;
+}
+
+static int print_class_metrics(const ViTModel *model,
+                               const VisionDataset *dataset) {
+    const size_t classes = model->config.classes;
+    float *probabilities =
+        malloc(dataset->sample_count * classes * sizeof(*probabilities));
+    const int result = !probabilities ||
+        vit_model_predict_probabilities(model, dataset->images,
+                                        dataset->sample_count,
+                                        probabilities) != 0 ||
+        print_prediction_metrics("test", probabilities, dataset->labels,
+                                 dataset->sample_count, classes, 1) != 0;
+    free(probabilities);
+    return result ? -1 : 0;
+}
+
+typedef struct {
+    float shift_y;
+    float shift_x;
+} TestTimeShift;
+
+static size_t test_time_shifts(size_t tta_views, TestTimeShift *shifts) {
+    const TestTimeShift identity_and_neighbors[] = {
+        {0.0f, 0.0f}, {-1.0f, 0.0f}, {1.0f, 0.0f}, {0.0f, -1.0f},
+        {0.0f, 1.0f}, {-1.0f, -1.0f}, {-1.0f, 1.0f}, {1.0f, -1.0f},
+        {1.0f, 1.0f},
+    };
+    const size_t available = sizeof(identity_and_neighbors) /
+                             sizeof(*identity_and_neighbors);
+    if (tta_views != 1 && tta_views != 5 && tta_views != available) {
+        return 0;
+    }
+    for (size_t i = 0; i < tta_views; ++i) {
+        shifts[i] = identity_and_neighbors[i];
+    }
+    return tta_views;
+}
+
+static int accumulate_test_time_probabilities(const ViTModel *model,
+                                              const VisionDataset *dataset,
+                                              const TestTimeShift *shifts,
+                                              size_t shift_count,
+                                              float *shifted_images,
+                                              float *view_probabilities,
+                                              float *model_probabilities) {
+    const size_t classes = model->config.classes;
+    const size_t probability_count = dataset->sample_count * classes;
+    memset(model_probabilities, 0, probability_count * sizeof(float));
+    for (size_t view = 0; view < shift_count; ++view) {
+        const int identity = shifts[view].shift_y == 0.0f &&
+                             shifts[view].shift_x == 0.0f;
+        const float *images = dataset->images;
+        if (!identity) {
+            if (data_augmentation_translate(
+                    dataset->images, shifted_images, dataset->sample_count,
+                    dataset->channels, dataset->height, dataset->width,
+                    shifts[view].shift_y, shifts[view].shift_x) != 0) {
+                return -1;
+            }
+            images = shifted_images;
+        }
+        if (vit_model_predict_probabilities(model, images,
+                                            dataset->sample_count,
+                                            view_probabilities) != 0) {
             return -1;
         }
-        size_t prediction = 0;
-        for (size_t class_index = 1; class_index < model->config.classes;
-             ++class_index) {
-            if (cache.logits.data[class_index] >
-                cache.logits.data[prediction]) {
-                prediction = class_index;
-            }
+        for (size_t i = 0; i < probability_count; ++i) {
+            model_probabilities[i] += view_probabilities[i] / (float)shift_count;
         }
-        const size_t label = dataset->labels[sample];
-        if (label < model->config.classes) {
-            ++total[label];
-            if (prediction == label) {
-                ++correct[label];
-            }
-        }
-    }
-    vit_model_cache_free(&cache);
-    printf("test accuracy by class:\n");
-    for (size_t class_index = 0; class_index < model->config.classes;
-         ++class_index) {
-        const float accuracy = total[class_index] == 0
-            ? 0.0f
-            : (float)correct[class_index] / (float)total[class_index];
-        printf("  class %zu: %.4f (%zu/%zu)\n", class_index, accuracy,
-               correct[class_index], total[class_index]);
     }
     return 0;
+}
+
+typedef struct {
+    const VisionDataset *dataset;
+    const char *name;
+    float *shifted_images;
+    float *view_probabilities;
+    float *model_probabilities;
+    float *ensemble_probabilities;
+} EvaluationSplit;
+
+static int init_evaluation_split(EvaluationSplit *split,
+                                 const VisionDataset *dataset,
+                                 const char *name, size_t classes) {
+    const size_t image_count = dataset->sample_count * dataset->channels *
+                               dataset->height * dataset->width;
+    const size_t probability_count = dataset->sample_count * classes;
+    split->dataset = dataset;
+    split->name = name;
+    split->shifted_images = malloc(image_count * sizeof(float));
+    split->view_probabilities = malloc(probability_count * sizeof(float));
+    split->model_probabilities = malloc(probability_count * sizeof(float));
+    split->ensemble_probabilities = calloc(probability_count, sizeof(float));
+    return split->shifted_images && split->view_probabilities &&
+                   split->model_probabilities && split->ensemble_probabilities
+        ? 0
+        : -1;
+}
+
+static void free_evaluation_split(EvaluationSplit *split) {
+    free(split->shifted_images);
+    free(split->view_probabilities);
+    free(split->model_probabilities);
+    free(split->ensemble_probabilities);
+}
+
+static int evaluate_ensemble(const char *checkpoint_list, size_t tta_views,
+                             const VisionDataset *validation,
+                             const VisionDataset *test) {
+    const size_t classes = 11;
+    TestTimeShift shifts[9];
+    const size_t shift_count = test_time_shifts(tta_views, shifts);
+    char *paths = malloc(strlen(checkpoint_list) + 1);
+    EvaluationSplit splits[2] = {{0}, {0}};
+    int result = shift_count == 0 || !paths ||
+        init_evaluation_split(&splits[0], validation, "validation", classes) ||
+        init_evaluation_split(&splits[1], test, "test", classes);
+    if (shift_count == 0) {
+        fprintf(stderr, "--tta accepts 1, 5 or 9 views\n");
+    }
+    size_t model_count = 0;
+    if (result == 0) {
+        strcpy(paths, checkpoint_list);
+        printf("ensemble test-time views=%zu\n", shift_count);
+    }
+    for (char *path = result == 0 ? strtok(paths, ",") : NULL;
+         result == 0 && path; path = strtok(NULL, ",")) {
+        ViTConfig config = {0};
+        ViTModel model = {0};
+        result = vit_model_read_config(path, &config) != 0 ||
+                 config.channels != validation->channels ||
+                 config.height != validation->height ||
+                 config.width != validation->width ||
+                 config.classes != classes ||
+                 vit_model_init(&model, &config) != 0 ||
+                 vit_model_load(&model, path) != 0;
+        if (result != 0) {
+            fprintf(stderr, "failed to load ensemble checkpoint %s\n", path);
+        }
+        printf("model %s patch=%zu d_model=%zu heads=%zu layers=%zu\n", path,
+               config.patch_size, config.d_model, config.heads, config.layers);
+        for (size_t s = 0; result == 0 && s < 2; ++s) {
+            EvaluationSplit *split = &splits[s];
+            const size_t probability_count =
+                split->dataset->sample_count * classes;
+            result = accumulate_test_time_probabilities(
+                &model, split->dataset, shifts, shift_count,
+                split->shifted_images, split->view_probabilities,
+                split->model_probabilities);
+            for (size_t i = 0; result == 0 && i < probability_count; ++i) {
+                split->ensemble_probabilities[i] +=
+                    split->model_probabilities[i];
+            }
+            printf("  ");
+            result = result ||
+                print_prediction_metrics(split->name,
+                                         split->model_probabilities,
+                                         split->dataset->labels,
+                                         split->dataset->sample_count, classes,
+                                         0);
+        }
+        vit_model_free(&model);
+        model_count += result == 0;
+    }
+    if (result == 0 && model_count > 0) {
+        printf("ensemble of %zu models:\n", model_count);
+        for (size_t s = 0; result == 0 && s < 2; ++s) {
+            EvaluationSplit *split = &splits[s];
+            const size_t probability_count =
+                split->dataset->sample_count * classes;
+            for (size_t i = 0; i < probability_count; ++i) {
+                split->ensemble_probabilities[i] /= (float)model_count;
+            }
+            result = print_prediction_metrics(
+                split->name, split->ensemble_probabilities,
+                split->dataset->labels, split->dataset->sample_count, classes,
+                s == 1);
+        }
+    }
+    free_evaluation_split(&splits[0]);
+    free_evaluation_split(&splits[1]);
+    free(paths);
+    return result == 0 && model_count > 0 ? 0 : -1;
 }
 
 typedef struct {
@@ -144,12 +505,16 @@ static int train_dataset(ViTModel *model, VisionDataset *dataset,
                          const char *metrics_path,
                          const float *class_weights,
                          const char *initial_checkpoint_path,
-                         float resume_learning_rate) {
+                         float resume_learning_rate,
+                         const DataAugmentation *augmentation,
+                         float label_smoothing, uint64_t seed) {
     ViTModelCache cache = {0};
     if (vit_model_cache_init(&cache, model, batch_size) != 0) {
         return -1;
     }
-    unsigned long random_state = 42;
+    const float minimum_learning_rate = 1e-7f;
+    unsigned long random_state = (unsigned long)seed;
+    uint64_t augmentation_random_state = seed ^ 0x9E3779B97F4A7C15ULL;
     float best_validation_loss = FLT_MAX;
     float scheduled_learning_rate = learning_rate;
     size_t plateau_bad_epochs = 0;
@@ -203,8 +568,10 @@ static int train_dataset(ViTModel *model, VisionDataset *dataset,
                 ? epoch - warmup_epochs
                 : 0;
             const float progress = (float)decay_step / (float)decay_steps;
-            epoch_learning_rate = scheduled_learning_rate *
-                (0.5f * (1.0f + cosf(PI_F * progress)));
+            epoch_learning_rate = fmaxf(
+                minimum_learning_rate,
+                scheduled_learning_rate *
+                    (0.5f * (1.0f + cosf(PI_F * progress))));
         }
         if (shuffle_dataset(dataset, &random_state) != 0) {
             vit_model_cache_free(&cache);
@@ -224,15 +591,37 @@ static int train_dataset(ViTModel *model, VisionDataset *dataset,
             float loss = 0.0f;
             const size_t image_size = dataset->height * dataset->width *
                                       dataset->channels;
-            if (vit_model_train_batch_weighted(
-                    model, dataset->images + offset * image_size,
+            float *augmented_images = NULL;
+            const float *batch_images =
+                dataset->images + offset * image_size;
+            if (data_augmentation_enabled(augmentation)) {
+                augmented_images = malloc(batch * image_size *
+                                           sizeof(*augmented_images));
+                if (!augmented_images ||
+                    data_augmentation_apply(
+                        augmentation, &augmentation_random_state,
+                        batch_images, augmented_images, batch,
+                        dataset->channels, dataset->height,
+                        dataset->width) != 0) {
+                    free(augmented_images);
+                    vit_model_cache_free(&cache);
+                    if (metrics_file) fclose(metrics_file);
+                    return -1;
+                }
+                batch_images = augmented_images;
+            }
+            if (vit_model_train_batch_smoothed(
+                    model, batch_images,
                     dataset->labels + offset, batch, &cache,
                     epoch_learning_rate,
-                    weight_decay, class_weights, &loss) != 0) {
+                    weight_decay, class_weights, label_smoothing,
+                    &loss) != 0) {
+                free(augmented_images);
                 vit_model_cache_free(&cache);
                 if (metrics_file) fclose(metrics_file);
                 return -1;
             }
+            free(augmented_images);
             epoch_loss += loss;
             ++batches;
         }
@@ -272,8 +661,8 @@ static int train_dataset(ViTModel *model, VisionDataset *dataset,
                 ++plateau_bad_epochs;
                 if (patience > 0 && plateau_bad_epochs >= patience) {
                     scheduled_learning_rate *= factor;
-                    if (scheduled_learning_rate < 1e-7f) {
-                        scheduled_learning_rate = 1e-7f;
+                    if (scheduled_learning_rate < minimum_learning_rate) {
+                        scheduled_learning_rate = minimum_learning_rate;
                     }
                     plateau_bad_epochs = 0;
                 }
@@ -319,6 +708,15 @@ static void print_usage(const char *program) {
     printf("         --metrics-csv PATH\n");
     printf("         --class-weights balanced\n");
     printf("         --resume-lr VALUE (override saved LR)\n");
+    printf("         --augment standard (lateral-safe augmentation preset)\n");
+    printf("         --max-shift PIXELS --max-rotation DEGREES --max-scale DELTA\n");
+    printf("         --brightness DELTA --contrast DELTA --noise-std VALUE\n");
+    printf("         --erasing-prob P --erasing-size FRACTION\n");
+    printf("         --label-smoothing VALUE\n");
+    printf("         --seed N\n");
+    printf("         --ensemble CKPT[,CKPT...] (evaluate only, no training)\n");
+    printf("         --tta 1|5|9 (test-time shifted views, default 1)\n");
+    printf("         --patch-size N --d-model N --heads N --layers N\n");
 }
 
 static int parse_named_arguments(int argc, char **argv,
@@ -334,7 +732,14 @@ static int parse_named_arguments(int argc, char **argv,
                                  size_t *early_stopping_patience,
                                  const char **metrics_path,
                                  int *balanced_class_weights,
-                                 float *resume_learning_rate) {
+                                 float *resume_learning_rate,
+                                 DataAugmentation *pixel_augmentation,
+                                 float *label_smoothing,
+                                 const char **ensemble_checkpoints,
+                                 size_t *tta_views,
+                                 size_t *patch_size, size_t *d_model,
+                                 size_t *heads, size_t *layers,
+                                 uint64_t *seed) {
     for (int index = 1; index < argc; ++index) {
         const char *option = argv[index];
         if (strcmp(option, "--help") == 0) {
@@ -376,6 +781,45 @@ static int parse_named_arguments(int argc, char **argv,
         }
         else if (strcmp(option, "--resume-lr") == 0)
             *resume_learning_rate = strtof(value, NULL);
+        else if (strcmp(option, "--augment") == 0) {
+            if (strcmp(value, "standard") != 0) {
+                fprintf(stderr, "--augment accepts only standard\n");
+                return -1;
+            }
+            *pixel_augmentation = standard_pixel_augmentation();
+        }
+        else if (strcmp(option, "--max-shift") == 0)
+            pixel_augmentation->max_shift_pixels = strtof(value, NULL);
+        else if (strcmp(option, "--max-rotation") == 0)
+            pixel_augmentation->max_rotation_degrees = strtof(value, NULL);
+        else if (strcmp(option, "--max-scale") == 0)
+            pixel_augmentation->max_scale_delta = strtof(value, NULL);
+        else if (strcmp(option, "--brightness") == 0)
+            pixel_augmentation->max_brightness_delta = strtof(value, NULL);
+        else if (strcmp(option, "--contrast") == 0)
+            pixel_augmentation->max_contrast_delta = strtof(value, NULL);
+        else if (strcmp(option, "--noise-std") == 0)
+            pixel_augmentation->noise_standard_deviation = strtof(value, NULL);
+        else if (strcmp(option, "--erasing-prob") == 0)
+            pixel_augmentation->erasing_probability = strtof(value, NULL);
+        else if (strcmp(option, "--erasing-size") == 0)
+            pixel_augmentation->erasing_max_side_fraction = strtof(value, NULL);
+        else if (strcmp(option, "--label-smoothing") == 0)
+            *label_smoothing = strtof(value, NULL);
+        else if (strcmp(option, "--seed") == 0)
+            *seed = (uint64_t)strtoull(value, NULL, 10);
+        else if (strcmp(option, "--ensemble") == 0)
+            *ensemble_checkpoints = value;
+        else if (strcmp(option, "--tta") == 0)
+            *tta_views = (size_t)strtoul(value, NULL, 10);
+        else if (strcmp(option, "--patch-size") == 0)
+            *patch_size = (size_t)strtoul(value, NULL, 10);
+        else if (strcmp(option, "--d-model") == 0)
+            *d_model = (size_t)strtoul(value, NULL, 10);
+        else if (strcmp(option, "--heads") == 0)
+            *heads = (size_t)strtoul(value, NULL, 10);
+        else if (strcmp(option, "--layers") == 0)
+            *layers = (size_t)strtoul(value, NULL, 10);
         else {
             fprintf(stderr, "unknown option: %s\n", option);
             return -1;
@@ -402,13 +846,24 @@ int main(int argc, char **argv) {
     const char *metrics_path = NULL;
     int balanced_class_weights = 0;
     float resume_learning_rate = 0.0f;
+    DataAugmentation pixel_augmentation = {0};
+    float label_smoothing = 0.0f;
+    const char *ensemble_checkpoints = NULL;
+    size_t tta_views = 1;
+    size_t patch_size = 4;
+    size_t d_model = 64;
+    size_t heads = 4;
+    size_t layers = 2;
+    uint64_t seed = 42;
     if (argc > 1 && argv[1][0] == '-') {
         const int parse_result = parse_named_arguments(
             argc, argv, &train_manifest, &validation_manifest, &test_manifest,
             &checkpoint_path, &batch_size, &epochs, &learning_rate,
             &weight_decay, &warmup_epochs, &scheduler, &patience, &factor,
             &resume_path, &early_stopping_patience, &metrics_path,
-            &balanced_class_weights, &resume_learning_rate);
+            &balanced_class_weights, &resume_learning_rate, &pixel_augmentation,
+            &label_smoothing, &ensemble_checkpoints, &tta_views,
+            &patch_size, &d_model, &heads, &layers, &seed);
         if (parse_result != 0) {
             return parse_result > 0 ? 0 : 1;
         }
@@ -431,18 +886,10 @@ int main(int argc, char **argv) {
             : early_stopping_patience;
         metrics_path = argc > 15 ? argv[15] : metrics_path;
     }
-#ifdef ENABLE_MPS
-    MPSBackend *mps_backend = NULL;
-    if (mps_backend_create(&mps_backend) != 0 ||
-        !mps_backend_available(mps_backend)) {
-        fprintf(stderr, "MPS backend unavailable\n");
-        mps_backend_free(mps_backend);
+    Accelerator *accelerator = NULL;
+    if (start_accelerator(&accelerator) != 0) {
         return 1;
     }
-    ops_set_gemm_backend(mps_backend_gemm_callback, mps_backend);
-    ops_set_gemm_backward_backend(mps_backend_gemm_backward_callback,
-                                  mps_backend);
-#endif
     if ((strcmp(scheduler, "plateau") != 0 &&
          strcmp(scheduler, "cosine") != 0 &&
          strcmp(scheduler, "constant") != 0) ||
@@ -450,6 +897,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "scheduler must be plateau, cosine, or constant; "
                         "patience > 0 and factor in (0,1)\n");
         return 1;
+    }
+    if (label_smoothing < 0.0f || label_smoothing >= 1.0f) {
+        fprintf(stderr, "label smoothing must be in [0,1)\n");
+        return 1;
+    }
+    const float default_erasing_side_fraction = 0.4f;
+    if (pixel_augmentation.erasing_probability > 0.0f &&
+        pixel_augmentation.erasing_max_side_fraction == 0.0f) {
+        pixel_augmentation.erasing_max_side_fraction =
+            default_erasing_side_fraction;
     }
 
     VisionDataset train = {0};
@@ -464,10 +921,7 @@ int main(int argc, char **argv) {
         test.height != train.height || test.width != train.width ||
         test.channels != train.channels) {
         fprintf(stderr, "failed to load 28x28 grayscale OrganSMNIST manifests\n");
-#ifdef ENABLE_MPS
-        ops_reset_gemm_backend();
-        mps_backend_free(mps_backend);
-#endif
+        stop_accelerator(accelerator);
         vision_dataset_free(&train);
         vision_dataset_free(&validation);
         vision_dataset_free(&test);
@@ -478,12 +932,39 @@ int main(int argc, char **argv) {
         .channels = 1,
         .height = 28,
         .width = 28,
-        .patch_size = 4,
-        .d_model = 64,
-        .heads = 4,
-        .layers = 2,
+        .patch_size = patch_size,
+        .d_model = d_model,
+        .heads = heads,
+        .layers = layers,
         .classes = 11,
     };
+    if (patch_size == 0 || 28 % patch_size != 0 || d_model == 0 ||
+        heads == 0 || d_model % heads != 0 || layers == 0) {
+        fprintf(stderr, "invalid ViT configuration: patch-size must divide 28, "
+                        "d-model must be divisible by heads, and values > 0\n");
+        vision_dataset_free(&train);
+        vision_dataset_free(&validation);
+        vision_dataset_free(&test);
+        return 1;
+    }
+    const PixelStatistics pixel_statistics = compute_pixel_statistics(&train);
+    normalize_dataset(&train, &pixel_statistics);
+    normalize_dataset(&validation, &pixel_statistics);
+    normalize_dataset(&test, &pixel_statistics);
+    printf("pixel normalization mean=%.6f std=%.6f\n", pixel_statistics.mean,
+           1.0f / pixel_statistics.inverse_standard_deviation);
+    if (ensemble_checkpoints) {
+        const int ensemble_result = evaluate_ensemble(
+            ensemble_checkpoints, tta_views, &validation, &test);
+        stop_accelerator(accelerator);
+        vision_dataset_free(&train);
+        vision_dataset_free(&validation);
+        vision_dataset_free(&test);
+        return ensemble_result == 0 ? 0 : 1;
+    }
+    const DataAugmentation augmentation =
+        normalize_augmentation(&pixel_augmentation, &pixel_statistics);
+    print_augmentation(&pixel_augmentation, label_smoothing);
     float class_weights[11];
     const float *class_weights_ptr = NULL;
     if (balanced_class_weights) {
@@ -502,19 +983,17 @@ int main(int argc, char **argv) {
         class_weights_ptr = class_weights;
     }
     ViTModel model = {0};
-    if (vit_model_init(&model, &config) != 0 ||
+    if (vit_model_init_seeded(&model, &config, seed) != 0 ||
         (resume_path && vit_model_load(&model, resume_path) != 0) ||
         train_dataset(&model, &train, &validation, checkpoint_path, batch_size,
                   epochs, learning_rate, weight_decay, warmup_epochs,
                   scheduler, patience, factor, resume_path != NULL,
                   early_stopping_patience, metrics_path,
                   class_weights_ptr, resume_path,
-                  resume_learning_rate) != 0) {
+                  resume_learning_rate, &augmentation,
+                  label_smoothing, seed) != 0) {
         fprintf(stderr, "OrganSMNIST training failed\n");
-#ifdef ENABLE_MPS
-        ops_reset_gemm_backend();
-        mps_backend_free(mps_backend);
-#endif
+        stop_accelerator(accelerator);
         vit_model_free(&model);
         vision_dataset_free(&train);
         vision_dataset_free(&validation);
@@ -524,10 +1003,7 @@ int main(int argc, char **argv) {
 
     if (vit_model_load(&model, checkpoint_path) != 0) {
         fprintf(stderr, "failed to restore best validation checkpoint\n");
-#ifdef ENABLE_MPS
-        ops_reset_gemm_backend();
-        mps_backend_free(mps_backend);
-#endif
+        stop_accelerator(accelerator);
         vit_model_free(&model);
         vision_dataset_free(&train);
         vision_dataset_free(&validation);
@@ -538,10 +1014,7 @@ int main(int argc, char **argv) {
     if (vit_model_evaluate(&model, validation.images, validation.labels,
                            validation.sample_count, &metrics) != 0) {
         fprintf(stderr, "OrganSMNIST evaluation failed\n");
-#ifdef ENABLE_MPS
-        ops_reset_gemm_backend();
-        mps_backend_free(mps_backend);
-#endif
+        stop_accelerator(accelerator);
         vit_model_free(&model);
         vision_dataset_free(&train);
         vision_dataset_free(&validation);
@@ -554,18 +1027,16 @@ int main(int argc, char **argv) {
     if (vit_model_evaluate(&model, test.images, test.labels,
                            test.sample_count, &metrics) != 0) {
         fprintf(stderr, "OrganSMNIST test evaluation failed\n");
-#ifdef ENABLE_MPS
-        ops_reset_gemm_backend();
-        mps_backend_free(mps_backend);
-#endif
+        stop_accelerator(accelerator);
         vit_model_free(&model);
         vision_dataset_free(&train);
         vision_dataset_free(&validation);
         vision_dataset_free(&test);
         return 1;
     }
-    printf("test accuracy=%.4f loss=%.6f samples/s=%.2f\n",
+    printf("test accuracy=%.4f loss=%.6f seconds=%.2f samples/s=%.2f\n",
            metrics.accuracy, metrics.average_loss,
+           metrics.elapsed_seconds,
            metrics.samples_per_second);
     if (print_class_metrics(&model, &test) != 0) {
         fprintf(stderr, "OrganSMNIST per-class evaluation failed\n");
@@ -580,9 +1051,6 @@ int main(int argc, char **argv) {
     vision_dataset_free(&train);
     vision_dataset_free(&validation);
     vision_dataset_free(&test);
-#ifdef ENABLE_MPS
-    ops_reset_gemm_backend();
-    mps_backend_free(mps_backend);
-#endif
+    stop_accelerator(accelerator);
     return 0;
 }

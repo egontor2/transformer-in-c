@@ -5,6 +5,7 @@
 #include "ops.h"
 
 #include <stddef.h>
+#include <stdint.h>
 
 typedef struct {
     size_t channels;
@@ -151,11 +152,17 @@ typedef struct {
 } ViTModel;
 
 typedef struct {
+    Tensor images;
+    Tensor patches;
     Tensor patch_tokens;
     Tensor tokens;
     ViTEncoderBlockCache *block_caches;
     Tensor normalized_tokens;
+    Tensor cls_tokens;
     Tensor logits;
+    Tensor targets;
+    Tensor class_weights;
+    Tensor loss;
     size_t batch;
     size_t layers;
 } ViTModelCache;
@@ -168,6 +175,8 @@ typedef struct {
 } ViTEvaluationMetrics;
 
 int vit_model_init(ViTModel *model, const ViTConfig *config);
+int vit_model_init_seeded(ViTModel *model, const ViTConfig *config,
+                          uint64_t seed);
 void vit_model_free(ViTModel *model);
 void vit_model_zero_grad(ViTModel *model);
 int vit_model_cache_init(ViTModelCache *cache, const ViTModel *model,
@@ -186,8 +195,15 @@ int vit_model_train_batch_weighted(
     ViTModel *model, const float *images, const size_t *targets, size_t batch,
     ViTModelCache *cache, float learning_rate, float weight_decay,
     const float *class_weights, float *loss);
+int vit_model_train_batch_smoothed(
+    ViTModel *model, const float *images, const size_t *targets, size_t batch,
+    ViTModelCache *cache, float learning_rate, float weight_decay,
+    const float *class_weights, float label_smoothing, float *loss);
 int vit_model_save(const ViTModel *model, const char *path);
 int vit_model_load(ViTModel *model, const char *path);
+int vit_model_read_config(const char *path, ViTConfig *config);
+int vit_model_predict_probabilities(const ViTModel *model, const float *images,
+                                    size_t sample_count, float *probabilities);
 int vit_model_evaluate(const ViTModel *model, const float *images,
                        const size_t *targets, size_t sample_count,
                        ViTEvaluationMetrics *metrics);

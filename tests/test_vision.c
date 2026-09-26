@@ -1,4 +1,5 @@
 #include "transformer.h"
+#include "augmentation.h"
 #include "dataset.h"
 #include "autodiff.h"
 #include "ops.h"
@@ -141,6 +142,61 @@ int main(void) {
         return 1;
     }
 
+    ViTEncoderBlock qkv_block = {0};
+    ViTEncoderBlockCache qkv_cache = {0};
+    Tensor qkv_input = {0};
+    Tensor qkv_input_grad = {0};
+    int qkv_failures = vit_encoder_block_init(&qkv_block, 8, 2, 5) != 0 ||
+        tensor_init(&qkv_input, 5, 8) != 0 ||
+        tensor_init(&qkv_input_grad, 5, 8) != 0 ||
+        vit_encoder_block_cache_init(&qkv_cache, &qkv_block, 1) != 0;
+    if (!qkv_failures) {
+        for (size_t i = 0; i < tensor_numel(&qkv_block.query_key_value.value); ++i) {
+            qkv_block.query_key_value.value.data[i] = sinf((float)i * 1.3f) * 0.5f;
+        }
+        for (size_t i = 0; i < tensor_numel(&qkv_block.attention_output.value); ++i) {
+            qkv_block.attention_output.value.data[i] = cosf((float)i * 0.7f) * 0.5f;
+        }
+        for (size_t i = 0; i < tensor_numel(&qkv_input); ++i) {
+            qkv_input.data[i] = sinf((float)i * 0.37f);
+        }
+        qkv_failures = vit_encoder_block_forward_cached(&qkv_block, &qkv_input,
+                                                        &qkv_cache) != 0;
+        for (size_t i = 0; i < tensor_numel(&qkv_cache.output); ++i) {
+            qkv_cache.output.grad[i] = 1.0f;
+        }
+        qkv_failures = qkv_failures ||
+            vit_encoder_block_backward(&qkv_block, &qkv_input, &qkv_cache,
+                                       &qkv_input_grad) != 0;
+        const size_t indices[] = {0, 17, 40, 90};
+        for (size_t k = 0; !qkv_failures && k < 4; ++k) {
+            float *weight = &qkv_block.query_key_value.value.data[indices[k]];
+            const float original = *weight;
+            const float step = 1e-3f;
+            float sums[2] = {0.0f, 0.0f};
+            for (int side = 0; side < 2; ++side) {
+                *weight = original + (side == 0 ? step : -step);
+                vit_encoder_block_forward_cached(&qkv_block, &qkv_input,
+                                                 &qkv_cache);
+                for (size_t i = 0; i < tensor_numel(&qkv_cache.output); ++i) {
+                    sums[side] += qkv_cache.output.data[i];
+                }
+            }
+            *weight = original;
+            const float numeric = (sums[0] - sums[1]) / (2.0f * step);
+            qkv_failures = fabsf(numeric -
+                qkv_block.query_key_value.value.grad[indices[k]]) > 2e-2f;
+        }
+    }
+    tensor_free(&qkv_input);
+    tensor_free(&qkv_input_grad);
+    vit_encoder_block_cache_free(&qkv_cache);
+    vit_encoder_block_free(&qkv_block);
+    if (qkv_failures) {
+        fprintf(stderr, "FAIL: ViT encoder block QKV gradient\n");
+        return 1;
+    }
+
     ViTConfig model_config = {1, 4, 4, 2, 4, 2, 1, 2};
     ViTModel model = {0};
     ViTModelCache model_cache = {0};
@@ -168,6 +224,33 @@ int main(void) {
     vit_model_free(&model);
     if (model_failures) {
         fprintf(stderr, "FAIL: integrated ViT model\n");
+        return 1;
+    }
+
+    ViTModel seeded_first = {0};
+    ViTModel seeded_second = {0};
+    ViTModel seeded_other = {0};
+    int seed_failures =
+        vit_model_init_seeded(&seeded_first, &model_config, 17) != 0 ||
+        vit_model_init_seeded(&seeded_second, &model_config, 17) != 0 ||
+        vit_model_init_seeded(&seeded_other, &model_config, 18) != 0;
+    if (!seed_failures) {
+        const Tensor *first = &seeded_first.patch_projection.projection.value;
+        const Tensor *second = &seeded_second.patch_projection.projection.value;
+        const Tensor *other = &seeded_other.patch_projection.projection.value;
+        int differs = 0;
+        for (size_t i = 0; i < tensor_numel(first); ++i) {
+            seed_failures = seed_failures ||
+                first->data[i] != second->data[i];
+            differs = differs || first->data[i] != other->data[i];
+        }
+        seed_failures = seed_failures || !differs;
+    }
+    vit_model_free(&seeded_first);
+    vit_model_free(&seeded_second);
+    vit_model_free(&seeded_other);
+    if (seed_failures) {
+        fprintf(stderr, "FAIL: seeded ViT initialization\n");
         return 1;
     }
 
@@ -709,6 +792,83 @@ int main(void) {
         dataset_model, dataset_images, labels, 2, 4, 4, 5, 0.1f);
     failures += expect(dataset_loss > 0.0f, "dataset training");
     transformer_free(dataset_model);
+
+    Tensor smoothed_logits = {0};
+    const size_t smoothed_targets[2] = {0, 2};
+    const float label_smoothing = 0.1f;
+    int smoothing_failures = tensor_init(&smoothed_logits, 2, 3) != 0;
+    if (!smoothing_failures) {
+        const float logits_values[6] = {2.0f, -1.0f, 0.5f, 0.0f, 1.0f, 3.0f};
+        memcpy(smoothed_logits.data, logits_values, sizeof(logits_values));
+        float smoothed_loss = 0.0f;
+        smoothing_failures = ops_softmax_cross_entropy_smoothed(
+            &smoothed_logits, smoothed_targets, NULL, label_smoothing,
+            &smoothed_loss, &smoothed_logits) != 0;
+        float expected_loss = 0.0f;
+        for (size_t row = 0; row < 2; ++row) {
+            const float *row_logits = logits_values + row * 3;
+            float normalizer = 0.0f;
+            for (size_t col = 0; col < 3; ++col) {
+                normalizer += expf(row_logits[col]);
+            }
+            float gradient_sum = 0.0f;
+            for (size_t col = 0; col < 3; ++col) {
+                const float target_probability =
+                    (col == smoothed_targets[row] ? 1.0f - label_smoothing : 0.0f) +
+                    label_smoothing / 3.0f;
+                expected_loss -= target_probability *
+                    (row_logits[col] - logf(normalizer)) / 2.0f;
+                gradient_sum += smoothed_logits.grad[row * 3 + col];
+            }
+            smoothing_failures = smoothing_failures || fabsf(gradient_sum) > 1e-6f;
+        }
+        smoothing_failures = smoothing_failures ||
+            fabsf(smoothed_loss - expected_loss) > 1e-5f;
+    }
+    tensor_free(&smoothed_logits);
+    failures += expect(!smoothing_failures, "label smoothing cross entropy");
+
+    float augmentation_source[2 * 16];
+    float augmentation_output[2 * 16];
+    for (size_t i = 0; i < 2 * 16; ++i) {
+        augmentation_source[i] = (float)(i % 16) / 15.0f;
+    }
+    uint64_t augmentation_random_state = 1;
+    DataAugmentation identity_augmentation = {0};
+    int augmentation_failures = data_augmentation_enabled(&identity_augmentation) ||
+        data_augmentation_apply(&identity_augmentation,
+                                &augmentation_random_state,
+                                augmentation_source, augmentation_output,
+                                2, 1, 4, 4) != 0 ||
+        memcmp(augmentation_source, augmentation_output,
+               sizeof(augmentation_source)) != 0;
+    DataAugmentation full_augmentation = {
+        .max_shift_pixels = 1.0f,
+        .max_rotation_degrees = 15.0f,
+        .max_scale_delta = 0.1f,
+        .max_brightness_delta = 0.1f,
+        .max_contrast_delta = 0.2f,
+        .noise_standard_deviation = 0.05f,
+        .erasing_probability = 1.0f,
+        .erasing_max_side_fraction = 0.5f,
+        .erasing_value = 0.5f,
+        .minimum_value = 0.0f,
+        .maximum_value = 1.0f,
+    };
+    augmentation_failures = augmentation_failures ||
+        !data_augmentation_enabled(&full_augmentation) ||
+        data_augmentation_apply(&full_augmentation, &augmentation_random_state,
+                                augmentation_source, augmentation_output,
+                                2, 1, 4, 4) != 0 ||
+        data_augmentation_apply(&full_augmentation, &augmentation_random_state,
+                                augmentation_source, augmentation_source,
+                                2, 1, 4, 4) == 0;
+    for (size_t i = 0; i < 2 * 16; ++i) {
+        augmentation_failures = augmentation_failures ||
+            !isfinite(augmentation_output[i]) ||
+            augmentation_output[i] < 0.0f || augmentation_output[i] > 1.0f;
+    }
+    failures += expect(!augmentation_failures, "data augmentation");
 
     transformer_free(first);
     transformer_free(second);

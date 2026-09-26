@@ -15,6 +15,8 @@ int mps_backend_available(const MPSBackend *backend);
 int mps_backend_gemm(MPSBackend *backend, const float *left,
                      const float *right, float *output, size_t left_rows,
                      size_t left_cols, size_t right_cols);
+int mps_backend_enable_device_execution(MPSBackend *backend);
+void mps_backend_disable_device_execution(MPSBackend *backend);
 int mps_backend_gemm_callback(void *context, const float *left,
                               const float *right, float *output,
                               size_t left_rows, size_t left_cols,

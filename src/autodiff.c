@@ -4,12 +4,53 @@
 #include <stdint.h>
 #include <string.h>
 
+static TensorAllocateFunction active_allocate;
+static TensorReleaseFunction active_release;
+static void *active_allocator_context;
+
+void tensor_set_allocator(TensorAllocateFunction allocate,
+                          TensorReleaseFunction release, void *context) {
+    const int complete_allocator = allocate && release;
+    active_allocate = complete_allocator ? allocate : NULL;
+    active_release = complete_allocator ? release : NULL;
+    active_allocator_context = complete_allocator ? context : NULL;
+}
+
+static float *allocate_zeroed_floats(const Tensor *tensor, size_t count) {
+    if (count > SIZE_MAX / sizeof(float)) {
+        return NULL;
+    }
+    if (tensor->release_memory) {
+        float *memory = active_allocate(active_allocator_context,
+                                        count * sizeof(float));
+        if (memory) {
+            memset(memory, 0, count * sizeof(float));
+        }
+        return memory;
+    }
+    return calloc(count, sizeof(float));
+}
+
+static void release_floats(const Tensor *tensor, float *memory) {
+    if (!memory) {
+        return;
+    }
+    if (tensor->release_memory) {
+        tensor->release_memory(tensor->release_context, memory);
+    } else {
+        free(memory);
+    }
+}
+
 int tensor_init(Tensor *tensor, size_t rows, size_t cols) {
-    if (!tensor || rows == 0 || cols == 0) {
+    if (!tensor || rows == 0 || cols == 0 || rows > SIZE_MAX / cols) {
         return -1;
     }
-    tensor->data = calloc(rows * cols, sizeof(float));
-    tensor->grad = calloc(rows * cols, sizeof(float));
+    memset(tensor, 0, sizeof(*tensor));
+    tensor->release_memory = active_release;
+    tensor->release_context = active_allocator_context;
+    tensor->data = allocate_zeroed_floats(tensor, rows * cols);
+    tensor->grad = allocate_zeroed_floats(tensor, rows * cols);
     tensor->ndim = 2;
     tensor->shape[0] = rows;
     tensor->shape[1] = cols;
@@ -68,8 +109,8 @@ void tensor_free(Tensor *tensor) {
         return;
     }
     if (tensor->owns_memory) {
-        free(tensor->data);
-        free(tensor->grad);
+        release_floats(tensor, tensor->data);
+        release_floats(tensor, tensor->grad);
     }
     memset(tensor, 0, sizeof(*tensor));
 }
@@ -89,10 +130,14 @@ int parameter_init(Parameter *parameter, size_t rows, size_t cols) {
     if (!parameter || tensor_init(&parameter->value, rows, cols) != 0) {
         return -1;
     }
-    const size_t count = rows * cols;
-    parameter->m = calloc(count, sizeof(float));
-    parameter->v = calloc(count, sizeof(float));
     parameter->step = 0;
+    if (tensor_init(&parameter->first_moment, rows, cols) != 0 ||
+        tensor_init(&parameter->second_moment, rows, cols) != 0) {
+        parameter_free(parameter);
+        return -1;
+    }
+    parameter->m = parameter->first_moment.data;
+    parameter->v = parameter->second_moment.data;
     if (!parameter->m || !parameter->v) {
         parameter_free(parameter);
         return -1;
@@ -105,8 +150,8 @@ void parameter_free(Parameter *parameter) {
         return;
     }
     tensor_free(&parameter->value);
-    free(parameter->m);
-    free(parameter->v);
+    tensor_free(&parameter->first_moment);
+    tensor_free(&parameter->second_moment);
     parameter->m = NULL;
     parameter->v = NULL;
     parameter->step = 0;
