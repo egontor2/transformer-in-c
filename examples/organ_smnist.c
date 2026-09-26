@@ -91,6 +91,47 @@ static int print_class_metrics(const ViTModel *model,
     return 0;
 }
 
+typedef struct {
+    size_t epoch;
+    float learning_rate;
+    float best_validation_loss;
+    size_t plateau_bad_epochs;
+} TrainingState;
+
+static int save_training_state(const char *checkpoint_path,
+                               const TrainingState *state) {
+    char path[4096];
+    if (!checkpoint_path || !state ||
+        snprintf(path, sizeof(path), "%s.state", checkpoint_path) >=
+            (int)sizeof(path)) {
+        return -1;
+    }
+    FILE *file = fopen(path, "wb");
+    if (!file) {
+        return -1;
+    }
+    const int result = fwrite(state, sizeof(*state), 1, file) == 1 ? 0 : -1;
+    fclose(file);
+    return result;
+}
+
+static int load_training_state(const char *checkpoint_path,
+                               TrainingState *state) {
+    char path[4096];
+    if (!checkpoint_path || !state ||
+        snprintf(path, sizeof(path), "%s.state", checkpoint_path) >=
+            (int)sizeof(path)) {
+        return -1;
+    }
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        return -1;
+    }
+    const int result = fread(state, sizeof(*state), 1, file) == 1 ? 0 : -1;
+    fclose(file);
+    return result;
+}
+
 static int train_dataset(ViTModel *model, VisionDataset *dataset,
                          const VisionDataset *validation,
                          const char *checkpoint_path,
@@ -101,17 +142,32 @@ static int train_dataset(ViTModel *model, VisionDataset *dataset,
                          int has_initial_checkpoint,
                          size_t early_stopping_patience,
                          const char *metrics_path,
-                         const float *class_weights) {
+                         const float *class_weights,
+                         const char *initial_checkpoint_path,
+                         float resume_learning_rate) {
     ViTModelCache cache = {0};
     if (vit_model_cache_init(&cache, model, batch_size) != 0) {
         return -1;
     }
     unsigned long random_state = 42;
-    float best_accuracy = -1.0f;
     float best_validation_loss = FLT_MAX;
     float scheduled_learning_rate = learning_rate;
     size_t plateau_bad_epochs = 0;
     size_t early_stopping_bad_epochs = 0;
+    TrainingState initial_state = {0};
+    if (has_initial_checkpoint &&
+        load_training_state(initial_checkpoint_path, &initial_state) == 0) {
+        scheduled_learning_rate = initial_state.learning_rate;
+        best_validation_loss = initial_state.best_validation_loss;
+        plateau_bad_epochs = initial_state.plateau_bad_epochs;
+        printf("resumed training state epoch=%zu lr=%.8f\n",
+               initial_state.epoch, scheduled_learning_rate);
+    }
+    if (has_initial_checkpoint && resume_learning_rate > 0.0f) {
+        scheduled_learning_rate = resume_learning_rate;
+        printf("overriding resumed learning rate with %.8f\n",
+               scheduled_learning_rate);
+    }
     FILE *metrics_file = metrics_path ? fopen(metrics_path, "w") : NULL;
     if (metrics_path && !metrics_file) {
         vit_model_cache_free(&cache);
@@ -130,14 +186,14 @@ static int train_dataset(ViTModel *model, VisionDataset *dataset,
             if (metrics_file) fclose(metrics_file);
             return -1;
         }
-        best_accuracy = initial_metrics.accuracy;
         best_validation_loss = initial_metrics.average_loss;
         printf("resumed checkpoint validation accuracy=%.4f val_loss=%.6f\n",
                initial_metrics.accuracy, initial_metrics.average_loss);
     }
     for (size_t epoch = 0; epoch < epochs; ++epoch) {
         float epoch_learning_rate = scheduled_learning_rate;
-        if (warmup_epochs > 0 && epoch < warmup_epochs) {
+        if (!has_initial_checkpoint && warmup_epochs > 0 &&
+            epoch < warmup_epochs) {
             epoch_learning_rate =
                 learning_rate * (float)(epoch + 1) / (float)warmup_epochs;
         } else if (strcmp(scheduler, "cosine") == 0 &&
@@ -192,9 +248,18 @@ static int train_dataset(ViTModel *model, VisionDataset *dataset,
         }
         const int validation_loss_improved =
             metrics.average_loss < best_validation_loss - 1e-5f;
-        if (metrics.accuracy > best_accuracy) {
-            best_accuracy = metrics.accuracy;
+        if (validation_loss_improved) {
             if (vit_model_save(model, checkpoint_path) != 0) {
+                vit_model_cache_free(&cache);
+                return -1;
+            }
+            TrainingState state = {
+                .epoch = epoch + 1,
+                .learning_rate = scheduled_learning_rate,
+                .best_validation_loss = metrics.average_loss,
+                .plateau_bad_epochs = 0,
+            };
+            if (save_training_state(checkpoint_path, &state) != 0) {
                 vit_model_cache_free(&cache);
                 return -1;
             }
@@ -253,6 +318,7 @@ static void print_usage(const char *program) {
     printf("         --early-stopping N (0 disables)\n");
     printf("         --metrics-csv PATH\n");
     printf("         --class-weights balanced\n");
+    printf("         --resume-lr VALUE (override saved LR)\n");
 }
 
 static int parse_named_arguments(int argc, char **argv,
@@ -267,7 +333,8 @@ static int parse_named_arguments(int argc, char **argv,
                                  const char **resume_path,
                                  size_t *early_stopping_patience,
                                  const char **metrics_path,
-                                 int *balanced_class_weights) {
+                                 int *balanced_class_weights,
+                                 float *resume_learning_rate) {
     for (int index = 1; index < argc; ++index) {
         const char *option = argv[index];
         if (strcmp(option, "--help") == 0) {
@@ -307,6 +374,8 @@ static int parse_named_arguments(int argc, char **argv,
             }
             *balanced_class_weights = 1;
         }
+        else if (strcmp(option, "--resume-lr") == 0)
+            *resume_learning_rate = strtof(value, NULL);
         else {
             fprintf(stderr, "unknown option: %s\n", option);
             return -1;
@@ -332,13 +401,14 @@ int main(int argc, char **argv) {
     size_t early_stopping_patience = 0;
     const char *metrics_path = NULL;
     int balanced_class_weights = 0;
+    float resume_learning_rate = 0.0f;
     if (argc > 1 && argv[1][0] == '-') {
         const int parse_result = parse_named_arguments(
             argc, argv, &train_manifest, &validation_manifest, &test_manifest,
             &checkpoint_path, &batch_size, &epochs, &learning_rate,
             &weight_decay, &warmup_epochs, &scheduler, &patience, &factor,
             &resume_path, &early_stopping_patience, &metrics_path,
-            &balanced_class_weights);
+            &balanced_class_weights, &resume_learning_rate);
         if (parse_result != 0) {
             return parse_result > 0 ? 0 : 1;
         }
@@ -438,7 +508,8 @@ int main(int argc, char **argv) {
                   epochs, learning_rate, weight_decay, warmup_epochs,
                   scheduler, patience, factor, resume_path != NULL,
                   early_stopping_patience, metrics_path,
-                  class_weights_ptr) != 0) {
+                  class_weights_ptr, resume_path,
+                  resume_learning_rate) != 0) {
         fprintf(stderr, "OrganSMNIST training failed\n");
 #ifdef ENABLE_MPS
         ops_reset_gemm_backend();

@@ -123,6 +123,14 @@ argumento. Se restauran los pesos, estados `m/v` y contadores de AdamW:
   build/organ_smnist.mps.vit
 ```
 
+El entrenamiento guarda además `CHECKPOINT.state` con la época del mejor
+checkpoint, el learning rate efectivo, la mejor `val_loss` y el estado de
+`ReduceLROnPlateau`. Al usar `--resume`, ese fichero se restaura junto con los
+pesos; si falta, se mantienen los valores proporcionados por CLI.
+
+Al reanudar no se repite el warmup. Para forzar deliberadamente otro learning
+rate inicial usa `--resume-lr`, por ejemplo `--resume-lr 0.00001`.
+
 También se puede usar la forma nombrada, recomendada para no depender del
 orden de los argumentos:
 
@@ -151,12 +159,18 @@ Para compensar desbalance de clases puede usarse
 `--class-weights balanced`; calcula pesos inversamente proporcionales a la
 frecuencia del split de entrenamiento.
 
+No se activa aumentación geométrica automáticamente: OrganSMNIST incluye clases
+laterales (`left`/`right`) y un flip horizontal puede cambiar la etiqueta
+anatómica. Una futura aumentación debe ser consciente de la lateralidad y
+validarse por clase antes de usarse en entrenamiento.
+
 Si el número de muestras no es múltiplo del batch, descarta únicamente el
 último batch incompleto; esto mantiene el cache de activaciones con tamaño
 fijo. La mezcla es importante porque los manifests generados por carpetas
 agrupan inicialmente todas las imágenes de una clase.
-El checkpoint se selecciona usando únicamente `val.csv`; después se restaura
-ese checkpoint y se informa `test.csv` una sola vez como métrica final.
+El checkpoint se selecciona por la menor `val_loss` de `val.csv`, alineado con
+`ReduceLROnPlateau` y early stopping; después se restaura ese checkpoint y se
+informa `test.csv` una sola vez como métrica final.
 
 Si el ZIP de Kaggle contiene imágenes en carpetas `train/0`, `train/1`, etc.,
 usa el conversor alternativo:
@@ -258,6 +272,11 @@ La arquitectura objetivo sigue el patrón habitual de MPS:
 La migración requiere añadir referencias de dispositivo a los tensores y una
 política explícita de sincronización CPU/GPU; no es correcto simularla copiando
 cada `Tensor` a un buffer temporal.
+
+El backend actual reutiliza buffers Metal por forma GEMM, reduciendo
+allocaciones repetidas. Todavía copia los datos CPU↔Metal y espera cada
+command buffer; la residencia completa de activaciones y la ejecución
+asíncrona siguen siendo trabajo futuro.
 
 La API `ops_set_gemm_backend` permite probar el dispatch MPS en operaciones GEMM
 del núcleo sin enlazar Metal en la librería CPU. Es un backend global y debe
