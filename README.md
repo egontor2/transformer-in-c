@@ -13,19 +13,19 @@ además como referencia numérica: cada kernel de GPU se valida contra ella.
 
 ## Resultados
 
-Partición oficial de MedMNIST (13 932 / 2 452 / 8 827 imágenes). Los modelos y
+Datos oficiales de MedMNIST (13 932 / 2 452 / 8 827 imágenes). Los modelos y
 los hiperparámetros se eligen por validación; test solo se usa para informar.
 
 | Modelo | Parámetros | Test acc. | Acc. equilibrada | Macro-F1 |
 |---|---:|---:|---:|---:|
-| ViT-C, patch 4, d=128, 4 capas | 0.80 M | 78.4 % | 0.746 | 0.750 |
-| Ensemble de 2 ViT-C + TTA 5 vistas | 2 × 0.80 M | **79.9 %** | **0.758** | **0.763** |
-| ResNet-18 (28×28), referencia MedMNIST v2 | 11 M | 78.2 % | — | — |
+| ViT-C, patch 4, d=128, 4 capas | 0.80 M | 75.9 % | 0.718 | 0.721 |
+| Ensemble de 2 ViT-C + TTA 9 vistas | 2 × 0.80 M | **78.6 %** | **0.745** | **0.754** |
+| ResNet-18 (28×28), referencia MedMNIST v2 | 11 M | 78.2 % | n.d. | n.d. |
 
-Cada época de entrenamiento tarda unos 8 s en un MacBook con chip M3 (GPU
-integrada). Casi el 40 % de los errores se concentra en los pares
-fémur izquierdo/derecho y riñón izquierdo/derecho, que en un corte sagital no
-se distinguen por el contenido de la imagen. La memoria en
+Cada época de entrenamiento tarda entre 8 y 13 s en un MacBook con chip M3
+(GPU integrada). Casi un tercio de los errores se concentra en los pares fémur
+izquierdo y derecho, y riñón izquierdo y derecho, que en un corte sagital no se
+distinguen por el contenido de la imagen. La memoria en
 [`paper/`](paper/) documenta el proyecto, los experimentos y la comparación
 con modelos preentrenados en PyTorch.
 
@@ -106,16 +106,22 @@ defecto `native`) pueden ajustarse, por ejemplo
 
 ## Datos
 
-OrganSMNIST se distribuye como `organsmnist.npz`. El conversor genera
-imágenes PGM y los manifiestos `train.csv`, `val.csv` y `test.csv`:
+Usa el fichero oficial `organsmnist.npz`, que ya contiene las imágenes a
+28×28. El conversor genera imágenes PGM y los manifiestos `train.csv`,
+`val.csv` y `test.csv`:
 
 ```sh
 python3 -m pip install numpy
+curl -L -o organsmnist.npz \
+  "https://zenodo.org/records/10519652/files/organsmnist.npz?download=1"
 python3 scripts/organ_smnist_to_pgm.py organsmnist.npz data/organ_smnist
 ```
 
-Si los datos están en carpetas por clase (`train/0`, `train/1`, ...), usa
-`scripts/images_to_pgm.py` (requiere Pillow).
+`scripts/images_to_pgm.py` convierte copias del dataset distribuidas como
+imágenes en carpetas por clase (requiere Pillow). Si esas imágenes están en
+alta resolución, la reducción a 28×28 da píxeles distintos de los oficiales y
+resultados no comparables: con la misma configuración, una copia reducida con
+Pillow obtuvo 2.5 puntos más en test que los datos oficiales.
 
 ## Entrenamiento
 
@@ -161,7 +167,7 @@ imagen; `--tta 9`, también las diagonales.
 
 ```sh
 ./build/organ_smnist_mps \
-  --ensemble build/vit_seed1.ckpt,build/vit_seed2.ckpt --tta 5
+  --ensemble build/vit_seed1.ckpt,build/vit_seed2.ckpt --tta 9
 ```
 
 Se informan las métricas de validación y test de cada modelo y del ensemble.
@@ -197,12 +203,11 @@ cabeza mayores de 64.
 
 ### Estado del backend CUDA
 
-El backend CUDA replica el de Metal kernel a kernel, pero se ha desarrollado
-en un Mac sin GPU NVIDIA: compila sin errores ni avisos en sus dos lados
-(host y device) con el soporte CUDA de clang, pero todavía no se ha compilado
-con `nvcc` ni ejecutado sobre hardware NVIDIA. Antes de usarlo, ejecuta
-`make cuda-test`, que entrena el mismo modelo en CPU y en GPU y compara la
-pérdida y los gradientes de todos los parámetros.
+El backend CUDA replica el de Metal kernel a kernel y se ha validado en una
+NVIDIA L40S: `make cuda-test` pasa en los tres caminos de la atención y, con
+los mismos datos y la misma semilla, el entrenamiento en la L40S y en un M3
+con Metal coincide en pérdida y precisión de validación hasta la sexta cifra
+decimal durante las dos primeras épocas.
 
 ## Tests
 
@@ -222,7 +227,6 @@ entrenamiento con la implementación C.
 - Solo precisión simple (fp32).
 - Los datos se cargan desde PGM; no hay lector de `.npz` en C.
 - El entrenamiento es de un solo proceso y una sola GPU.
-- El backend CUDA no se ha validado todavía en hardware NVIDIA.
 
 ## Licencia
 
