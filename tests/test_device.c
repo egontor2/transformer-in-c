@@ -2,6 +2,7 @@
 #include "cuda_backend.h"
 typedef CudaBackend DeviceBackend;
 #define DEVICE_NAME "CUDA"
+#define DEVICE_LABEL "cuda"
 #define device_backend_create cuda_backend_create
 #define device_backend_available cuda_backend_available
 #define device_backend_enable cuda_backend_enable_device_execution
@@ -11,6 +12,7 @@ typedef CudaBackend DeviceBackend;
 #include "mps_backend.h"
 typedef MPSBackend DeviceBackend;
 #define DEVICE_NAME "Metal"
+#define DEVICE_LABEL "metal"
 #define device_backend_create mps_backend_create
 #define device_backend_available mps_backend_available
 #define device_backend_enable mps_backend_enable_device_execution
@@ -167,7 +169,7 @@ static int run_scenario(DeviceBackend *backend, const TestScenario *scenario) {
                           image_grad, &accelerated_loss) != 0;
     if (failures == 0) {
         ops_synchronize();
-        printf("  forward loss cpu=%.7f metal=%.7f\n", reference_loss,
+        printf("  forward loss cpu=%.7f " DEVICE_LABEL "=%.7f\n", reference_loss,
                accelerated_loss);
         failures += fabsf(reference_loss - accelerated_loss) > 1e-4f;
         failures += compare_gradients(&reference, &accelerated);
@@ -186,7 +188,7 @@ static int run_scenario(DeviceBackend *backend, const TestScenario *scenario) {
                             scenario->training_steps, reference_losses) != 0;
     for (size_t step = 0; failures == 0 && step < scenario->training_steps;
          ++step) {
-        printf("  step %2zu loss cpu=%.6f metal=%.6f\n", step + 1,
+        printf("  step %2zu loss cpu=%.6f " DEVICE_LABEL "=%.6f\n", step + 1,
                reference_losses[step], accelerated_losses[step]);
         failures += fabsf(reference_losses[step] - accelerated_losses[step]) >
                     1e-3f;
